@@ -47,3 +47,34 @@ CRAWL_TIMEOUT_SECONDS = float(os.getenv("TREND_CRAWL_TIMEOUT_SECONDS", "0")) or 
 REPORT_DIR = Path(
     os.getenv("TREND_REPORT_DIR") or (PROJECT_ROOT / "data" / "trend_reports")
 )
+
+
+# --------------------------------------------------------------------------- #
+# 图片分析（切片 5）：凭据、成本上限、缓存位置
+# --------------------------------------------------------------------------- #
+
+# 凭据**一律外部注入**（.env / 环境变量），代码里不硬编码任何 key。
+# 缺凭据不是错误：R6 要求模型可缺席，此时整条链路降级为「未运行」而不是失败。
+LLM_API_KEY_ENV = "TREND_LLM_API_KEY"
+LLM_BASE_URL_ENV = "TREND_LLM_BASE_URL"
+LLM_MODEL_ENV = "TREND_LLM_MODEL"
+DEFAULT_LLM_BASE_URL = "https://api.openai.com/v1"
+
+# 成本上限：只分析榜单前 N 条、每帖最多送 K 张图。
+# 请求量直接等于模型账单，所以要有一个**默认**上限，而不是靠调用方记得传参数。
+VISION_TOP_N = int(os.getenv("TREND_VISION_TOP_N", "20"))
+VISION_MAX_IMAGES_PER_POST = int(os.getenv("TREND_VISION_MAX_IMAGES", "4"))
+VISION_MAX_TERMS_PER_POST = int(os.getenv("TREND_VISION_MAX_TERMS", "6"))
+
+VISION_REQUEST_TIMEOUT = float(os.getenv("TREND_LLM_TIMEOUT", "120"))
+# 重试默认值由真机 429 定：原先 2 次重试（等 ~1s、~2s）在 20 条的批次里丢了 7 条。
+# 现在 4 次、指数退避到 16s，并优先遵守响应里的 Retry-After。
+VISION_MAX_RETRIES = int(os.getenv("TREND_LLM_RETRIES", "4"))
+VISION_RETRY_WAIT = float(os.getenv("TREND_LLM_RETRY_WAIT", "2.0"))
+# Retry-After 可能给得很大；上限防止一条响应把整轮卡死。
+VISION_RETRY_AFTER_MAX = float(os.getenv("TREND_LLM_RETRY_AFTER_MAX", "30"))
+
+# 图片缓存。落在 data/ 下，已被 .gitignore 忽略。
+VISION_IMAGE_DIR = Path(
+    os.getenv("TREND_IMAGE_DIR") or (PROJECT_ROOT / "data" / "trend_images")
+)

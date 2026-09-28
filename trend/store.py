@@ -22,9 +22,16 @@ import config as app_config
 
 from trend import models  # noqa: F401 —— 导入即为注册 ORM 元数据，顺序不可省
 from trend.config import DESC_EXCERPT_LEN
-from trend.models import TrendCrawlRun, TrendPostScore
+from trend.models import TrendCrawlRun, TrendPostScore, TrendPostVision, TrendStyleAnalysis
 from trend.parsing import normalize_epoch_seconds, parse_engagement_count, parse_string_list
 from trend.scoring import composite_score
+from trend.vision import (
+    STATUS_FAILED,
+    TERMINAL_STATUSES,
+    ImageRef,
+    VisionRead,
+    VisionTerm,
+)
 
 DB_BACKENDS = ("sqlite", "mysql", "db", "postgres")
 
@@ -566,3 +573,452 @@ async def count_by_keyword(platform: str) -> tuple[tuple[str, int], ...]:
             .order_by(func.count().desc())
         )
         return tuple((row[0] or "", int(row[1])) for row in result.all())
+
+
+# --------------------------------------------------------------------------- #
+# 图片证据：读取图片 URL、逐帖读数与批次台账
+# --------------------------------------------------------------------------- #
+
+
+def _ordered_unique(values: Sequence[str]) -> tuple[str, ...]:
+    """去重并保持原顺序 —— 图片顺序是「封面在前」的语义，不能排序。"""
+    seen: dict[str, None] = {}
+    for value in values:
+        text = (value or "").strip()
+        if text:
+            seen.setdefault(text, None)
+    return tuple(seen)
+
+
+async def fetch_note_image_urls(
+    platform: str, note_ids: Sequence[str]
+) -> dict[str, tuple[str, ...]]:
+    """按 note_id 回读原始存档的 `image_list`。
+
+    刻意不动 `trend_post_score`：仓库没有 alembic 环境，建表走
+    `create_all(checkfirst=True)`，它只建缺失的表、**不改已存在的表** ——
+    给打分表加列意味着手写迁移，而图片 URL 只在分析时需要，没必要抄一份到派生表里
+    （抄了还会在重采时与原始表漂移）。
+    """
+    wanted = tuple(dict.fromkeys(note_id for note_id in note_ids if note_id))
+    if not wanted:
+        return {}
+
+    model = _note_model(platform)
+    async with _session() as session:
+        result = await session.execute(
+            select(model.note_id, model.image_list).where(model.note_id.in_(wanted))
+        )
+        rows = result.all()
+
+    # 同一 note_id 可能有多行（note_id 无唯一约束）；空值不覆盖已有非空值。
+    collected: dict[str, tuple[str, ...]] = {}
+    for note_id, raw_images in rows:
+        key = str(note_id or "")
+        if not key:
+            continue
+        urls = _ordered_unique(parse_string_list(raw_images))
+        if urls:
+            collected[key] = urls
+    return collected
+
+
+def _terms_to_json(terms: Sequence[VisionTerm]) -> str:
+    return json.dumps(
+        [
+            {
+                "dimension": term.dimension,
+                "term": term.term,
+                "image_indices": list(term.image_indices),
+                "confidence": term.confidence,
+                "reason": term.reason,
+            }
+            for term in terms
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _evidence_to_json(refs: Sequence[ImageRef]) -> str:
+    return json.dumps(
+        [
+            {"index": ref.index, "url": ref.url, "local_path": ref.local_path}
+            for ref in refs
+        ],
+        ensure_ascii=False,
+    )
+
+
+def _parse_terms(raw: object) -> tuple[VisionTerm, ...]:
+    """读回词条。**整行 JSON 坏了才报错**，单条坏词条跳过。"""
+    if not raw:
+        return ()
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError as exc:
+        raise ValueError(f"词条 JSON 已损坏：{exc}") from exc
+    if not isinstance(payload, list):
+        raise ValueError("词条 JSON 顶层必须是数组")
+
+    terms: list[VisionTerm] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        indices = item.get("image_indices")
+        if not isinstance(indices, list) or not indices:
+            # 没有图片编号的词条不得被读回来 —— 它一旦进来就成了无证据结论。
+            continue
+        try:
+            parsed_indices = tuple(int(index) for index in indices)
+        except (TypeError, ValueError):
+            continue
+        try:
+            confidence = float(item.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        terms.append(
+            VisionTerm(
+                dimension=str(item.get("dimension") or ""),
+                term=str(item.get("term") or ""),
+                image_indices=parsed_indices,
+                confidence=confidence,
+                reason=str(item.get("reason") or ""),
+            )
+        )
+    return tuple(terms)
+
+
+def _parse_evidence(raw: object) -> tuple[ImageRef, ...]:
+    if not raw:
+        return ()
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError as exc:
+        raise ValueError(f"证据 JSON 已损坏：{exc}") from exc
+    if not isinstance(payload, list):
+        raise ValueError("证据 JSON 顶层必须是数组")
+
+    refs: list[ImageRef] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        raw_index = item.get("index")
+        if raw_index is None:
+            continue
+        try:
+            index = int(raw_index)
+        except (TypeError, ValueError):
+            continue
+        url = str(item.get("url") or "")
+        if not url:
+            continue
+        local_path = item.get("local_path")
+        refs.append(
+            ImageRef(
+                index=index,
+                url=url,
+                local_path=str(local_path) if local_path else None,
+            )
+        )
+    return tuple(refs)
+
+
+def _to_vision_read(record: Any) -> VisionRead:
+    """把库行读成 `VisionRead`。
+
+    损坏的行**降级成 failed**，而不是抛异常或当成空读数：一次读取记录坏掉不该让
+    整份报告产不出来，但也绝不能被当成「读过且没看出风格」—— 那会把数据事故
+    讲成一个关于穿搭的结论。
+    """
+    note_id = str(getattr(record, "note_id", "") or "")
+    try:
+        terms = _parse_terms(getattr(record, "terms_json", None))
+        evidence = _parse_evidence(getattr(record, "evidence_json", None))
+    except ValueError as exc:
+        return VisionRead(note_id=note_id, status=STATUS_FAILED, error=str(exc))
+
+    return VisionRead(
+        note_id=note_id,
+        status=getattr(record, "status", None) or STATUS_FAILED,
+        terms=terms,
+        evidence=evidence,
+        error=getattr(record, "error", None) or "",
+        raw_excerpt=getattr(record, "raw_excerpt", None) or "",
+    )
+
+
+async def fetch_vision_reads(platform: str, analysis_version: str) -> list[VisionRead]:
+    """取某个分析版本下的全部逐帖读数。报告重建的唯一模型侧数据来源。"""
+    async with _session() as session:
+        result = await session.execute(
+            select(TrendPostVision)
+            .where(
+                TrendPostVision.platform == platform,
+                TrendPostVision.analysis_version == analysis_version,
+            )
+            .order_by(TrendPostVision.note_id.asc())
+        )
+        records = result.scalars().all()
+    return [_to_vision_read(record) for record in records]
+
+
+async def fetch_analyzed_note_ids(platform: str, analysis_version: str) -> set[str]:
+    """**已读完**的帖子 id —— 只算终态，`failed` 不算。
+
+    真机教训：首轮 20 条里 7 条撞 429 限流。若把 failed 也当「读过了」，重跑会跳过
+    它们，一次限流抖动就变成永久缺失。限定终态后，重跑会自动只补没读成功的那些，
+    已成功的仍然一次都不重读（成本不受影响）。
+    """
+    async with _session() as session:
+        result = await session.execute(
+            select(TrendPostVision.note_id).where(
+                TrendPostVision.platform == platform,
+                TrendPostVision.analysis_version == analysis_version,
+                TrendPostVision.status.in_(tuple(TERMINAL_STATUSES)),
+            )
+        )
+        return {str(row[0]) for row in result.all() if row[0]}
+
+
+def _to_vision_orm(
+    read: VisionRead,
+    *,
+    platform: str,
+    analysis_version: str,
+    run_id: str,
+    model_id: str,
+    now: int,
+) -> TrendPostVision:
+    return TrendPostVision(
+        platform=platform,
+        note_id=read.note_id,
+        analysis_version=analysis_version,
+        run_id=run_id,
+        model_id=model_id,
+        status=read.status,
+        terms_json=_terms_to_json(read.terms),
+        evidence_json=_evidence_to_json(read.evidence),
+        images_sent=len(read.evidence),
+        raw_excerpt=read.raw_excerpt,
+        error=read.error,
+        created_ts=now,
+    )
+
+
+async def persist_vision_reads(
+    reads: Sequence[VisionRead],
+    *,
+    platform: str,
+    analysis_version: str,
+    run_id: str,
+    model_id: str,
+) -> tuple[int, int, int]:
+    """落库。返回 (新增数, 补读成功数, 跳过数)。
+
+    规则是「只插不改」**加一条例外**：已存在且上次是 `failed` 的行允许被覆盖。
+
+    - 终态（`ok` / `no_style_signal` / `no_images`）**永不改写**。这是 Q3 的核心：
+      要重读必须换模型/提示词/词表产生新版本；否则已经把图片引用发出去的结论会被
+      悄悄换掉。
+    - `failed` 可以覆盖。这不是改写结论，而是把一次限流/超时**补全**成一个结果 ——
+      真机上正是这一点让 7 条被 429 挡掉的帖子能在重跑时补上。
+    """
+    deduped: dict[str, VisionRead] = {}
+    for read in reads:
+        if read.note_id:
+            deduped[read.note_id] = read
+    if not deduped:
+        return 0, 0, 0
+
+    now = int(time.time())
+    async with _session() as session:
+        result = await session.execute(
+            select(TrendPostVision.note_id, TrendPostVision.status).where(
+                TrendPostVision.platform == platform,
+                TrendPostVision.analysis_version == analysis_version,
+                TrendPostVision.note_id.in_(tuple(deduped)),
+            )
+        )
+        existing = {str(row[0]): (row[1] or "") for row in result.all()}
+
+        inserted = 0
+        replaced = 0
+        skipped = 0
+        for note_id, read in deduped.items():
+            previous = existing.get(note_id)
+            if previous is None:
+                session.add(
+                    _to_vision_orm(
+                        read,
+                        platform=platform,
+                        analysis_version=analysis_version,
+                        run_id=run_id,
+                        model_id=model_id,
+                        now=now,
+                    )
+                )
+                inserted += 1
+                continue
+            if previous != STATUS_FAILED:
+                skipped += 1
+                continue
+
+            await session.execute(
+                update(TrendPostVision)
+                .where(
+                    TrendPostVision.platform == platform,
+                    TrendPostVision.analysis_version == analysis_version,
+                    TrendPostVision.note_id == note_id,
+                )
+                .values(
+                    run_id=run_id,
+                    model_id=model_id,
+                    status=read.status,
+                    terms_json=_terms_to_json(read.terms),
+                    evidence_json=_evidence_to_json(read.evidence),
+                    images_sent=len(read.evidence),
+                    raw_excerpt=read.raw_excerpt,
+                    error=read.error,
+                    created_ts=now,
+                )
+            )
+            replaced += 1
+        await session.flush()
+    return inserted, replaced, skipped
+
+
+@dataclass(frozen=True)
+class StyleAnalysisRecord:
+    analysis_id: str
+    analysis_version: str
+    run_id: str
+    platform: str
+    model_id: str
+    prompt_version: str
+    vocabulary_version: str
+    score_formula_version: str
+    status: str
+    posts_considered: int
+    posts_analyzed: int
+    posts_failed: int
+    posts_no_image: int
+    images_sent: int
+    terms_rejected: int
+    error_sample: str
+    started_ts: int | None
+    finished_ts: int | None
+
+
+def _to_style_analysis_record(record: Any) -> StyleAnalysisRecord:
+    return StyleAnalysisRecord(
+        analysis_id=record.analysis_id,
+        analysis_version=record.analysis_version or "",
+        run_id=record.run_id or "",
+        platform=record.platform or "",
+        model_id=record.model_id or "",
+        prompt_version=record.prompt_version or "",
+        vocabulary_version=record.vocabulary_version or "",
+        score_formula_version=record.score_formula_version or "",
+        status=record.status or "",
+        posts_considered=record.posts_considered or 0,
+        posts_analyzed=record.posts_analyzed or 0,
+        posts_failed=record.posts_failed or 0,
+        posts_no_image=record.posts_no_image or 0,
+        images_sent=record.images_sent or 0,
+        terms_rejected=record.terms_rejected or 0,
+        error_sample=record.error_sample or "",
+        started_ts=record.started_ts,
+        finished_ts=record.finished_ts,
+    )
+
+
+async def start_style_analysis(
+    analysis_id: str,
+    *,
+    run_id: str,
+    platform: str,
+    analysis_version: str,
+    model_id: str,
+    prompt_version: str,
+    vocabulary_version: str,
+    score_formula_version: str,
+    posts_considered: int,
+) -> None:
+    now = int(time.time())
+    async with _session() as session:
+        session.add(
+            TrendStyleAnalysis(
+                analysis_id=analysis_id,
+                analysis_version=analysis_version,
+                run_id=run_id,
+                platform=platform,
+                model_id=model_id,
+                prompt_version=prompt_version,
+                vocabulary_version=vocabulary_version,
+                score_formula_version=score_formula_version,
+                status="running",
+                posts_considered=posts_considered,
+                started_ts=now,
+                created_ts=now,
+            )
+        )
+
+
+async def finish_style_analysis(
+    analysis_id: str,
+    *,
+    status: str,
+    posts_analyzed: int,
+    posts_failed: int,
+    posts_no_image: int,
+    images_sent: int,
+    terms_rejected: int,
+    error_sample: str = "",
+) -> None:
+    async with _session() as session:
+        statement = (
+            update(TrendStyleAnalysis)
+            .where(TrendStyleAnalysis.analysis_id == analysis_id)
+            .values(
+                status=status,
+                posts_analyzed=posts_analyzed,
+                posts_failed=posts_failed,
+                posts_no_image=posts_no_image,
+                images_sent=images_sent,
+                terms_rejected=terms_rejected,
+                error_sample=error_sample,
+                finished_ts=int(time.time()),
+            )
+        )
+        await session.execute(statement)
+
+
+async def latest_style_analysis(
+    platform: str,
+    *,
+    run_id: str | None = None,
+    analysis_version: str | None = None,
+) -> StyleAnalysisRecord | None:
+    """取最近一次**已结束**的分析台账。
+
+    刻意排除 running：上一次分析中途崩掉时，拿它的半成品去渲染报告，会把
+    「还没读完」讲成「结果就是这样」。宁可显示「未运行」。
+    """
+    async with _session() as session:
+        statement = (
+            select(TrendStyleAnalysis)
+            .where(
+                TrendStyleAnalysis.platform == platform,
+                TrendStyleAnalysis.status != "running",
+            )
+            .order_by(TrendStyleAnalysis.id.desc())
+        )
+        if run_id:
+            statement = statement.where(TrendStyleAnalysis.run_id == run_id)
+        if analysis_version:
+            statement = statement.where(
+                TrendStyleAnalysis.analysis_version == analysis_version
+            )
+        result = await session.execute(statement.limit(1))
+        record = result.scalars().first()
+    return _to_style_analysis_record(record) if record else None

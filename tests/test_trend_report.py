@@ -7,8 +7,11 @@
 
 from trend.report import (
     ReportData,
+    ReportImageRef,
     ReportPost,
     ReportRun,
+    ReportStyleAnalysis,
+    ReportStyleFinding,
     ReportTagFrequency,
     ReportTextAnalysis,
     ReportTextFinding,
@@ -70,18 +73,171 @@ def _data(posts=(_post(),), keyword_counts=None, **overrides) -> ReportData:
     return ReportData(**base)
 
 
+def _style_analysis(**overrides) -> ReportStyleAnalysis:
+    base = dict(
+        analysis_version="vision-abc123",
+        model_id="glm-4v",
+        prompt_version="prompt-def456-s1",
+        vocabulary_version="vocab-ghi789-m1",
+        status="succeeded",
+        posts_considered=12,
+        posts_read=10,
+        posts_failed=1,
+        posts_no_image=1,
+        images_sent=9,
+        rejected_terms=2,
+        findings=(
+            ReportStyleFinding(
+                dimension="风格",
+                term="韩系",
+                post_count=4,
+                engagement_sum=12.5,
+                evidence=(
+                    ReportImageRef(
+                        note_id="n1",
+                        image_index=1,
+                        image_url="https://example.invalid/1.jpg",
+                    ),
+                ),
+            ),
+        ),
+    )
+    base.update(overrides)
+    return ReportStyleAnalysis(**base)
+
+
 # --------------------------------------------------------------------------- #
 # 质量底线 Q1：不臆造 —— 没有图片证据就不出风格结论
 # --------------------------------------------------------------------------- #
 
 
-def test_report_declares_no_style_conclusions_in_this_slice():
+def test_report_declares_style_analysis_not_run_instead_of_claiming_a_result():
+    """没跑过图片分析时，报告必须说「未运行」，而不是说「没有风格」。
+
+    把「未执行」讲成「没有」，就是把一个流程状态讲成了一个关于穿搭的结论。
+    """
     text = render_report(_data())
-    assert "风格结论：仍然不产出" in text
+    assert "风格结论：本轮未运行图片分析" in text
     assert "无图片证据不下风格结论" in text
-    # 两类证据等级必须被点名，后续切片才能分区展示
+    # 两类证据等级必须被点名，读者才知道两种结论不是一回事
     assert "text_only" in text
     assert "image_backed" in text
+
+
+def test_skipped_for_missing_credentials_is_reported_as_not_run():
+    text = render_report(
+        _data(
+            style_analysis=ReportStyleAnalysis(
+                analysis_version="vision-x",
+                model_id="",
+                prompt_version="prompt-x",
+                vocabulary_version="vocab-x",
+                status="skipped_no_credentials",
+                posts_considered=0,
+                posts_read=0,
+                posts_failed=0,
+                posts_no_image=0,
+                images_sent=0,
+                rejected_terms=0,
+            )
+        )
+    )
+
+    assert "本轮未运行图片分析" in text
+    assert "缺少模型凭据" in text
+
+
+def test_image_backed_section_lists_findings_with_clickable_evidence():
+    text = render_report(_data(style_analysis=_style_analysis()))
+
+    assert "## 风格结论（证据等级：image_backed）" in text
+    assert "不可混读" in text
+    assert "韩系" in text
+    assert "[n1#1](https://example.invalid/1.jpg)" in text
+    # 覆盖率要报出来，只报结论不报覆盖是另一种失真
+    assert "候选 12 条" in text
+    assert "送出图片 9 张" in text
+
+
+def test_image_backed_section_precedes_the_text_only_section():
+    text = render_report(
+        _data(text_analysis=_text_analysis(), style_analysis=_style_analysis())
+    )
+
+    assert text.index("## 风格结论（证据等级：image_backed）") < text.index(
+        "## 文本线索（证据等级：text_only）"
+    )
+
+
+def test_failed_reads_are_declared_as_unjudged_not_absent():
+    text = render_report(_data(style_analysis=_style_analysis(posts_failed=3)))
+
+    assert "读取失败 3 条" in text
+    assert "未被判定" in text
+
+
+def test_empty_findings_explain_why_instead_of_showing_a_blank_table():
+    text = render_report(
+        _data(style_analysis=_style_analysis(findings=(), posts_read=0, posts_failed=4))
+    )
+
+    assert "没有产生任何风格结论" in text
+    assert "不是「没有风格」，是没读到" in text
+
+
+def test_unsafe_image_url_is_rendered_as_plain_text_not_a_link():
+    """图片 URL 同样来自被爬平台，`javascript:` 之流不得变成可点链接。"""
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="韩系",
+                        post_count=1,
+                        engagement_sum=1.0,
+                        evidence=(
+                            ReportImageRef(
+                                note_id="n1",
+                                image_index=1,
+                                image_url="javascript:alert(1)",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+    )
+
+    assert "javascript:" not in text
+    assert "n1#1" in text
+
+
+def test_hostile_finding_text_is_escaped_in_the_table():
+    """维度/词条来自模型，同样是不可信文本。"""
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格|注入",
+                        term="韩系](http://evil.invalid)",
+                        post_count=1,
+                        engagement_sum=1.0,
+                        evidence=(
+                            ReportImageRef(
+                                note_id="n1",
+                                image_index=1,
+                                image_url="https://example.invalid/1.jpg",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+    )
+
+    assert "http://evil.invalid)" not in text
 
 
 # --------------------------------------------------------------------------- #

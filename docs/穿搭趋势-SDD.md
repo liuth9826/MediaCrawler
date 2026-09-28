@@ -83,7 +83,8 @@ composite = log1p(raw)
 | 爬取触发方式 | 子进程调用既有 `main.py` | 隔离浏览器/登录生命周期；失败时存档仍在（R6） |
 | 存档后端 | **SQLite** | CSV/JSON/JSONL 后端不做去重，会破坏 R5「同一内容不重复分析」 |
 | 博主信息 | 从已采集帖子聚合 | 仓库已刻意删除创作者档案表并匿名化 `user_id`（`database/models.py:19-25`）。不新增身份采集，尊重既有隐私设计 |
-| 分析后端 | 接口 + `NullAnalyzer` | 当前 CLI 无凭据、无 API Key。R6 本就要求模型可缺席 |
+| 分析后端 | 接口 + `NullAnalyzer` + `VisionStyleAnalyzer` | R6 要求模型可缺席，所以「缺席」是一等公民：无凭据时 `build_analyzer` 返回 `NullAnalyzer`，记一条 `skipped_no_credentials` 就收工。凭据**外接**：`TREND_LLM_API_KEY` / `TREND_LLM_MODEL` / `TREND_LLM_BASE_URL` 经 `.env` 注入，代码零硬编码 |
+| 模型接口形态 | OpenAI 兼容 `/chat/completions` | 一个 key + base_url 通吃 OpenAI / 智谱 / 通义 / 豆包 等；图片以 base64 `data:` URI 随消息送出。刻意**不依赖** `response_format=json_object`（并非所有兼容端点都支持） |
 | 评估模式 | `code-only` | 边界明确不做 WebUI |
 
 ## 7. 复用清单（一律不重写）
@@ -109,18 +110,46 @@ composite = log1p(raw)
 
 | # | 切片 | 状态 |
 |---|------|------|
-| 1 | 最小闭环：包骨架 + CLI + 编排 + SQLite 存档 + 版本化打分 + `crawl_run` 记账 + Top-N 报告 | 本次 |
-| 2 | 博主聚合：从已采集帖子反推博主传播力榜 | |
-| 3 | 分析层接口 + `NullAnalyzer` + 版本化 | |
-| 4 | 规则/词表分析（`text_only`） | |
-| 5 | 图片证据 + 真实模型（`image_backed`） | |
-| 6 | 上升 vs 热门 + 报告重建 | |
-| — | 定时（launchd/cron） | 已推迟 |
+| 1 | 最小闭环：包骨架 + CLI + 编排 + SQLite 存档 + 版本化打分 + `crawl_run` 记账 + Top-N 报告 | 已完成 |
+| 2 | 博主聚合：从已采集帖子反推博主传播力榜 | **建议不做** —— `nickname` 已脱敏、`creator_hash` 仅匿名哈希、创作者档案表被上游刻意删除，做出来是一张匿名哈希榜 |
+| 3 | 分析层接口 + `NullAnalyzer` + 版本化 | 已完成（并入切片 5，未单独做） |
+| 4 | 规则/词表分析（`text_only`） | 已完成 |
+| 5 | 图片证据 + 真实模型（`image_backed`） | 已完成 |
+| 6 | 上升 vs 热门 + 报告重建 | 待做 —— 「上升」需要两次相隔时间的运行做对比，历史不足时应如实标「数据不足」而非编造 |
+| — | 定时（launchd/cron） | 已推迟（请求量 = 小号风控暴露面，必须克制） |
+
+### 9.1 切片 5 的落地形态
+
+- **新表**：`trend_style_analysis`（批次台账）+ `trend_post_vision`（逐帖模型读数）。
+  后者唯一键为 `(platform, note_id, analysis_version)`，**不含** `analysis_id`：含它则
+  同版本重跑会重复插入并在聚合时双计。据此得到三个性质：同版本重跑零模型调用、
+  存档增长时增量只读新帖（R5）、换模型/提示词/词表即产生新版本且旧行不动（Q3）。
+- **聚合不落库**：`trend/vision.py::aggregate_vision_reads` 是纯函数，所以调整聚合规则后
+  仍可免模型重建报告。
+- **Q1 的两道闸**：提示词要求每个词条必须带图片编号；`trend/llm.py::parse_model_reply`
+  再把不在词表内、或编号缺失/越界的词条**逐条丢弃并计数**。`validate_finding` 是最后一道，
+  触发即意味着有 bug —— 应当变响而不是被静默放过。
+- **图片 URL 不进打分表**：`trend/store.py::fetch_note_image_urls` 在分析时按 note_id 回读
+  原始 `xhs_note.image_list`。仓库没有 alembic 环境，建表走 `create_all(checkfirst=True)`
+  —— 它只建缺失的表、**不改已存在的表**，所以新增表免费、给打分表加列则需手写迁移。
+- **命令**：`trend analyze`（不采集）。刻意不给 `trend run` 加 `--vision`：采集要动小号、
+  要用户在场，分析只读库和图片；绑成一条命令会让「只想重跑分析」也必须冒一次风控风险。
+- **成本默认上限**：榜单前 20 条 × 每帖最多 4 图，均由 CLI 参数与 `TREND_VISION_*` 覆盖。
+- **失败可补读，成功永不改写**。初版把 `failed` 也算「已读过」，真机首轮 20 条里 7 条撞
+  HTTP 429 —— 重跑直接跳过它们，一次限流抖动就被冻结成永久缺失，唯一补救是换版本，
+  而那样会把已成功的十几条全部重读一遍。现规则：只有 `ok` / `no_style_signal` /
+  `no_images` 算终态；`failed` 行允许被下一次重跑覆盖。**这不削弱 Q3** —— 成功的结论
+  仍然一次都不改写。实测第二次运行只重发了那 7 条，13 条的 `created_ts` 原封不动。
+- **限流退避优先听端点的 `Retry-After`**（上限 30s，防止一条响应卡死整轮），没有该头时
+  才退回指数退避；重试次数由 2 提到 4。
 
 ## 10. 前置条件与风险
 
 - **实测需一次性地登录小红书**。`crawler.start()` 必定走登录流程；`browser_data/` 登录态失效时需扫码。这是唯一无法由开发方单方完成的前置条件。
 - **GAN 评估器无法自行跑真实爬取**（无登录态）。因此切片 1 配套录制 fixture，使全链路在无登录、无网络、无模型时可回归 —— 同时满足 R6「可复跑」。
+- **图片分析需要外部模型凭据**（切片 5）。本机唯一可见的模型入口是 Claude Desktop 的本地网关，其 token 由宿主注入、不宜复用于本项目，故改为走 OpenAI 兼容接口 + `.env` 外接凭据。
+  无凭据时链路**降级而非失败**：`trend analyze` 记一条 `skipped_no_credentials`，报告声明「本轮未运行图片分析」。
+  真实跑图的验证必须由用户在场完成（与采集同理，不在无人看管下发起）。
 
 ## 11. 不可信输入与并发（切片 1 加固）
 

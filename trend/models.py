@@ -80,3 +80,76 @@ class TrendPostScore(Base):
     last_scored_run_id = Column(String(64), comment="最近一次打分的运行ID")
     created_ts = Column(BigInteger, comment="创建时间戳")
     updated_ts = Column(BigInteger, comment="更新时间戳")
+
+
+class TrendStyleAnalysis(Base):
+    """一次图片分析的批次台账。
+
+    与 `TrendCrawlRun` 同构：start 时写一行 running，finish 时补状态与计数。
+    每次执行都**追加**一行，不覆盖历史 —— Q3 的「新旧可区分」因此是结构性的。
+    """
+
+    __tablename__ = "trend_style_analysis"
+
+    id = Column(Integer, primary_key=True, comment="主键ID")
+    analysis_id = Column(
+        String(64), nullable=False, unique=True, index=True, comment="分析执行ID"
+    )
+    analysis_version = Column(String(64), index=True, comment="分析版本(内容哈希)")
+    run_id = Column(String(64), index=True, comment="关联的采集运行ID")
+    platform = Column(String(32), index=True, comment="平台")
+    model_id = Column(String(128), comment="模型标识")
+    prompt_version = Column(String(64), comment="提示词版本")
+    vocabulary_version = Column(String(64), comment="词表版本")
+    score_formula_version = Column(String(32), comment="打分公式版本")
+    status = Column(
+        String(32),
+        comment="running/succeeded/partial/failed/skipped_no_credentials",
+    )
+    posts_considered = Column(Integer, comment="进入候选的帖子数")
+    posts_analyzed = Column(Integer, comment="成功读取的帖子数")
+    posts_failed = Column(Integer, comment="读取失败的帖子数")
+    posts_no_image = Column(Integer, comment="无可用图片的帖子数")
+    images_sent = Column(Integer, comment="送出的图片张数")
+    terms_rejected = Column(Integer, comment="被拒绝的词条数")
+    error_sample = Column(Text, comment="错误样本(截断)")
+    started_ts = Column(BigInteger, comment="开始时间戳")
+    finished_ts = Column(BigInteger, comment="结束时间戳")
+    created_ts = Column(BigInteger, comment="创建时间戳")
+
+
+class TrendPostVision(Base):
+    """模型对**单个帖子**的读取结果。
+
+    这是 Q1 的证据载体，也是「免模型重建报告」的数据来源：报告侧只读这张表 +
+    `trend_post_score`，不碰任何模型。
+
+    唯一键是 (platform, note_id, analysis_version)，**不含** analysis_id：
+    - 含 analysis_id（每次执行都变）会让同版本重跑插入重复行，聚合时双计；
+    - 不含它则同版本重跑直接跳过已读的帖子，零模型调用；存档增长时只增量读新帖（R5）；
+    - 换模型/提示词/词表 → 新 analysis_version → 新行，旧行原样保留（Q3）。
+    """
+
+    __tablename__ = "trend_post_vision"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform",
+            "note_id",
+            "analysis_version",
+            name="uq_trend_post_vision_platform_note_version",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, comment="主键ID")
+    platform = Column(String(32), index=True, comment="平台")
+    note_id = Column(String(255), index=True, comment="帖子ID")
+    analysis_version = Column(String(64), index=True, comment="分析版本(内容哈希)")
+    run_id = Column(String(64), comment="首次写入该行的运行ID")
+    model_id = Column(String(128), comment="模型标识")
+    status = Column(String(32), comment="ok/no_style_signal/no_images/failed")
+    terms_json = Column(Text, comment="模型读出的词条(JSON)")
+    evidence_json = Column(Text, comment="实际送出的图片(JSON)")
+    images_sent = Column(Integer, comment="送出的图片张数")
+    raw_excerpt = Column(Text, comment="模型原始回复(截断，仅供审计)")
+    error = Column(Text, comment="错误信息")
+    created_ts = Column(BigInteger, comment="创建时间戳")

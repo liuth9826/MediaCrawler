@@ -11,7 +11,9 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
+
+from media_downloader.downloader import MediaDownloader
 
 from trend import store
 from trend.config import (
@@ -23,6 +25,8 @@ from trend.config import (
     ERROR_RATE_THRESHOLD,
     REPORT_DIR,
     SCORE_FORMULA_VERSION,
+    VISION_MAX_IMAGES_PER_POST,
+    VISION_TOP_N,
 )
 from trend.analysis import AnalysisPost, analyse
 from trend.crawler import (
@@ -34,14 +38,27 @@ from trend.crawler import (
     requested_volume,
     run_crawl,
 )
+from trend.images import build_image_downloader, fetch_note_images
+from trend.llm import StyleAnalyzer, VisionRequest, build_analyzer
 from trend.report import (
     ReportData,
+    ReportImageRef,
     ReportPost,
     ReportRun,
+    ReportStyleAnalysis,
+    ReportStyleFinding,
     ReportTagFrequency,
     ReportTextAnalysis,
     ReportTextFinding,
     render_report,
+)
+from trend.vision import (
+    STATUS_NO_IMAGES,
+    EvidenceError,
+    ImageRef,
+    VisionRead,
+    aggregate_vision_reads,
+    validate_finding,
 )
 from trend.vocab import Vocabulary, load_vocabulary
 
@@ -230,6 +247,67 @@ async def build_report_data(
         keyword_counts=await store.count_by_keyword(platform),
         top_n=top_n,
         text_analysis=_build_text_analysis(all_posts, vocabulary),
+        # 分数复用上面那次 fetch_scored_posts 的结果，不再查一次库。
+        style_analysis=await _build_style_analysis(
+            platform, scores={item.note_id: item.composite_score for item in all_posts}
+        ),
+    )
+
+
+async def _build_style_analysis(
+    platform: str, *, scores: Mapping[str, float]
+) -> ReportStyleAnalysis | None:
+    """从**已落库的逐帖读数**装配风格结论。
+
+    这条路不碰任何分析器、不发任何请求 —— 它是 R6「报告能脱离模型重建」的落点。
+    聚合是纯函数（`trend/vision.py`），所以调整聚合规则后仍可免模型重算。
+    """
+    record = await store.latest_style_analysis(platform)
+    if record is None:
+        return None
+
+    reads = await store.fetch_vision_reads(platform, record.analysis_version)
+    aggregated = aggregate_vision_reads(
+        reads, version=record.analysis_version, scores=scores
+    )
+
+    findings: list[ReportStyleFinding] = []
+    for finding in aggregated.findings:
+        try:
+            validate_finding(finding)
+        except EvidenceError:
+            # 最后一道 Q1 闸：没有图片引用的结论绝不进报告。
+            continue
+        findings.append(
+            ReportStyleFinding(
+                dimension=finding.dimension,
+                term=finding.term,
+                post_count=finding.post_count,
+                engagement_sum=finding.engagement_sum,
+                evidence=tuple(
+                    ReportImageRef(
+                        note_id=ref.note_id,
+                        image_index=ref.image_index,
+                        image_url=ref.image_url,
+                    )
+                    for ref in finding.evidence
+                ),
+            )
+        )
+
+    return ReportStyleAnalysis(
+        analysis_version=record.analysis_version,
+        model_id=record.model_id,
+        prompt_version=record.prompt_version,
+        vocabulary_version=record.vocabulary_version,
+        status=record.status,
+        posts_considered=record.posts_considered,
+        posts_read=aggregated.posts_read,
+        posts_failed=aggregated.posts_failed,
+        posts_no_image=aggregated.posts_no_image,
+        images_sent=aggregated.images_sent,
+        rejected_terms=aggregated.rejected_terms,
+        findings=tuple(findings),
     )
 
 
@@ -442,4 +520,227 @@ async def rebuild_report(
         top_n=top_n,
         output_dir=output_dir,
         vocabulary=vocabulary,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 图片分析（切片 5）：只读存档 + 抓图 + 调模型，不采集
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AnalysisResult:
+    analysis_id: str
+    run_id: str
+    analysis_version: str
+    status: str
+    posts_considered: int
+    posts_analyzed: int
+    posts_failed: int
+    posts_no_image: int
+    images_sent: int
+    rejected_terms: int
+    findings: int
+    report_path: Path | None
+    report_markdown: str
+
+
+async def _analyze_pending(
+    *,
+    platform: str,
+    analysis_version: str,
+    run_id: str,
+    posts: Sequence[store.StoredPost],
+    scores: Mapping[str, float],
+    analyzer: StyleAnalyzer,
+    downloader: MediaDownloader,
+    max_images: int,
+) -> tuple[str, dict[str, int], str]:
+    """读还没读过的帖子，落库，然后按该版本的**全量**读数聚合。"""
+    already = await store.fetch_analyzed_note_ids(platform, analysis_version)
+    pending = [post for post in posts if post.note_id not in already]
+    urls_by_note = await store.fetch_note_image_urls(
+        platform, [post.note_id for post in pending]
+    )
+
+    reads: list[VisionRead] = []
+    for post in pending:
+        images = await fetch_note_images(
+            post.note_id,
+            urls_by_note.get(post.note_id, ()),
+            downloader=downloader,
+            max_images=max_images,
+        )
+        if not images:
+            # 一张图都没下到：记「无图」，不送模型（无图请求会诱导它照提示词编）。
+            reads.append(VisionRead(note_id=post.note_id, status=STATUS_NO_IMAGES))
+            continue
+        reads.append(
+            await analyzer.analyze(
+                VisionRequest(
+                    note_id=post.note_id,
+                    images=tuple(
+                        ImageRef(
+                            index=image.index, url=image.url, local_path=str(image.path)
+                        )
+                        for image in images
+                    ),
+                    image_bytes=tuple(image.data for image in images),
+                )
+            )
+        )
+
+    await store.persist_vision_reads(
+        reads,
+        platform=platform,
+        analysis_version=analysis_version,
+        run_id=run_id,
+        model_id=analyzer.info.model_id,
+    )
+
+    # 用该版本的全量读数聚合，而不是只用本轮新增的 —— 否则增量运行的报告会只
+    # 反映最新那几条帖子，历史结论凭空消失。
+    all_reads = await store.fetch_vision_reads(platform, analysis_version)
+    aggregated = aggregate_vision_reads(
+        all_reads, version=analysis_version, scores=scores
+    )
+
+    if aggregated.posts_read == 0 and aggregated.posts_failed:
+        status = "failed"
+    elif aggregated.posts_failed:
+        status = "partial"
+    else:
+        status = "succeeded"
+
+    error_sample = next(
+        (read.error[:ERROR_SAMPLE_LEN] for read in reads if read.error), ""
+    )
+    counts = {
+        "posts_analyzed": aggregated.posts_read,
+        "posts_failed": aggregated.posts_failed,
+        "posts_no_image": aggregated.posts_no_image,
+        "images_sent": aggregated.images_sent,
+        "terms_rejected": aggregated.rejected_terms,
+    }
+    return status, counts, error_sample
+
+
+async def run_analysis(
+    *,
+    run_id: str | None = None,
+    platform: str = DEFAULT_PLATFORM,
+    vision_top_n: int = VISION_TOP_N,
+    max_images: int = VISION_MAX_IMAGES_PER_POST,
+    save_data_option: str = DEFAULT_SAVE_DATA_OPTION,
+    analyzer: StyleAnalyzer | None = None,
+    downloader: MediaDownloader | None = None,
+    vocabulary: Vocabulary | None = None,
+    output_dir: str | Path | None = None,
+    render: bool = True,
+) -> AnalysisResult:
+    """对**既有存档**做图片分析。
+
+    刻意与 `run_pipeline` 分开：采集要动小号、要用户在场；分析只读库和图片。绑成
+    一条命令会让「只是想重跑分析」也必须冒一次风控风险。
+
+    无凭据不是错误，而是记一条 `skipped_no_credentials` 台账就收工（R6）。
+    """
+    store.use_backend(save_data_option)
+    store.validate_platform(platform)
+    await store.init_trend_tables()
+
+    vocab = vocabulary if vocabulary is not None else load_vocabulary()
+
+    if run_id is None:
+        latest = await store.latest_run(platform)
+        if latest is None:
+            raise KeyError("库内没有任何运行记录，请先执行一次 `trend run`。")
+        run_id = latest.run_id
+
+    posts = await store.fetch_scored_posts(platform, limit=vision_top_n)
+    scores = {post.note_id: post.composite_score for post in posts}
+
+    owns_analyzer = analyzer is None
+    active = analyzer or build_analyzer(
+        vocabulary=vocab, score_formula_version=SCORE_FORMULA_VERSION
+    )
+    version = active.info.analysis_version
+    analysis_id = uuid.uuid4().hex[:16]
+
+    await store.start_style_analysis(
+        analysis_id,
+        run_id=run_id,
+        platform=platform,
+        analysis_version=version,
+        model_id=active.info.model_id,
+        prompt_version=active.info.prompt_version,
+        vocabulary_version=vocab.version,
+        score_formula_version=SCORE_FORMULA_VERSION,
+        posts_considered=len(posts),
+    )
+
+    status = "skipped_no_credentials"
+    error_sample = ""
+    counts = {
+        "posts_analyzed": 0,
+        "posts_failed": 0,
+        "posts_no_image": 0,
+        "images_sent": 0,
+        "terms_rejected": 0,
+    }
+
+    try:
+        if active.info.available:
+            status, counts, error_sample = await _analyze_pending(
+                platform=platform,
+                analysis_version=version,
+                run_id=run_id,
+                posts=posts,
+                scores=scores,
+                analyzer=active,
+                downloader=downloader or build_image_downloader(platform=platform),
+                max_images=max_images,
+            )
+        else:
+            error_sample = str(getattr(active, "reason", "未配置模型凭据"))[
+                :ERROR_SAMPLE_LEN
+            ]
+    finally:
+        # 只关我们自己造的那个；调用方注入的分析器由调用方负责。
+        if owns_analyzer:
+            await active.aclose()
+
+    await store.finish_style_analysis(
+        analysis_id, status=status, error_sample=error_sample, **counts
+    )
+
+    report_path: Path | None = None
+    report_markdown = ""
+    if render:
+        emitted = await _emit(
+            run_id=run_id,
+            platform=platform,
+            top_n=DEFAULT_TOP_N,
+            output_dir=output_dir,
+            vocabulary=vocab,
+        )
+        report_path = emitted.report_path
+        report_markdown = emitted.report_markdown
+
+    built = await _build_style_analysis(platform, scores=scores)
+
+    return AnalysisResult(
+        analysis_id=analysis_id,
+        run_id=run_id,
+        analysis_version=version,
+        status=status,
+        posts_considered=len(posts),
+        posts_analyzed=counts["posts_analyzed"],
+        posts_failed=counts["posts_failed"],
+        posts_no_image=counts["posts_no_image"],
+        images_sent=counts["images_sent"],
+        rejected_terms=counts["terms_rejected"],
+        findings=len(built.findings) if built else 0,
+        report_path=report_path,
+        report_markdown=report_markdown,
     )

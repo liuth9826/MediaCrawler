@@ -81,6 +81,49 @@ class ReportTextAnalysis:
 
 
 @dataclass(frozen=True)
+class ReportImageRef:
+    """结论 → 具体图片的引用。报告里点得开的那条链。"""
+
+    note_id: str
+    image_index: int
+    image_url: str
+
+
+@dataclass(frozen=True)
+class ReportStyleFinding:
+    """一条 `image_backed` 风格结论。
+
+    `evidence` 非空是该等级的**定义**，不是约定 —— Q1 的校验在 runner 映射之前完成，
+    报告侧只负责渲染，不负责判断证据够不够。
+    """
+
+    dimension: str
+    term: str
+    post_count: int
+    engagement_sum: float
+    evidence: tuple[ReportImageRef, ...]
+    evidence_level: str = "image_backed"
+
+
+@dataclass(frozen=True)
+class ReportStyleAnalysis:
+    """图片分析的整体结果，含覆盖率与失败数 —— 只报结论不报覆盖率是另一种失真。"""
+
+    analysis_version: str
+    model_id: str
+    prompt_version: str
+    vocabulary_version: str
+    status: str
+    posts_considered: int
+    posts_read: int
+    posts_failed: int
+    posts_no_image: int
+    images_sent: int
+    rejected_terms: int
+    findings: tuple[ReportStyleFinding, ...] = ()
+
+
+@dataclass(frozen=True)
 class ReportRun:
     run_id: str
     platform: str
@@ -105,6 +148,7 @@ class ReportData:
     keyword_counts: tuple[tuple[str, int], ...]
     top_n: int
     text_analysis: ReportTextAnalysis | None = None
+    style_analysis: ReportStyleAnalysis | None = None
 
 
 # 能改写 Markdown 结构或注入 HTML 的字符。标题/标签/昵称都来自被爬平台，属不可信文本。
@@ -162,7 +206,7 @@ def render_report(data: ReportData) -> str:
         "",
         _render_metrics(data),
         "",
-        _render_style_claim_status(),
+        _render_style_section(data),
     ]
 
     text_clues = _render_text_clues(data)
@@ -261,18 +305,112 @@ def _render_query_mix_warning(
     ]
 
 
-def _render_style_claim_status() -> str:
+def _render_style_section(data: ReportData) -> str:
+    """风格结论区。三种形态：没跑过 / 跑了但缺凭据 / 跑了有结果。
+
+    「没跑」与「跑了没发现」必须分开讲 —— 把前者写成后者，就是把一次未执行的
+    分析讲成一个关于穿搭的结论（这正是 Q1 要防的那类失真）。
+    """
+    analysis = data.style_analysis
+    if analysis is None or analysis.status == "skipped_no_credentials":
+        return _render_style_not_run(analysis)
+    return _render_style_conclusions(analysis)
+
+
+def _render_style_not_run(analysis: ReportStyleAnalysis | None) -> str:
+    reason = (
+        "本报告生成时尚未运行过图片分析。"
+        if analysis is None
+        else "上一次图片分析因缺少模型凭据而跳过，没有读取任何图片。"
+    )
     return "\n".join(
         [
-            "## 风格结论：仍然不产出",
+            "## 风格结论：本轮未运行图片分析",
             "",
-            "本报告**没有任何风格 / 元素结论** —— 图片证据链路尚未接入，系统一张图都没看过。",
+            f"{reason}因此本报告**没有任何风格 / 元素结论**。",
             "",
-            "这是质量底线「无图片证据不下风格结论」的直接结果。本报告中的文本统计一律标为 "
-            "`text_only`，**不构成风格判断**；等图片证据打通（切片 5），`image_backed` 的"
-            "结论会单独成区表述。",
+            "这是质量底线「无图片证据不下风格结论」的直接结果：一张图都没看过，就不给"
+            "风格判断。下方的文字统计一律标为 `text_only`，**不构成风格判断**。",
+            "",
+            "接入方式：配置 `TREND_LLM_API_KEY` 与 `TREND_LLM_MODEL`（可选 "
+            "`TREND_LLM_BASE_URL`）后执行 `uv run python -m trend analyze`；"
+            "届时风格结论会以 `image_backed` 等级单独成区展示。",
         ]
     )
+
+
+def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
+    lines = [
+        "## 风格结论（证据等级：image_backed）",
+        "",
+        "本节结论**来自模型读取帖子图片**。它与下方「文本线索（text_only）」的证据等级"
+        "不同，**不可混读**。",
+        "",
+        f"- 分析版本：`{_cell(analysis.analysis_version, limit=48)}`"
+        "（提示词 / 词表 / 模型 / 打分公式任一变化都会换新版本）",
+        f"- 模型：`{_cell(analysis.model_id, limit=48)}`　"
+        f"提示词：`{_cell(analysis.prompt_version, limit=48)}`　"
+        f"词表：`{_cell(analysis.vocabulary_version, limit=48)}`",
+        f"- 覆盖度：候选 {_fmt_int(analysis.posts_considered)} 条 → 成功读取 "
+        f"{_fmt_int(analysis.posts_read)} 条 / 读取失败 {_fmt_int(analysis.posts_failed)} 条 / "
+        f"无可用图片 {_fmt_int(analysis.posts_no_image)} 条",
+        f"- 送出图片 {_fmt_int(analysis.images_sent)} 张；丢弃词条 "
+        f"{_fmt_int(analysis.rejected_terms)} 条（不在词表内、或没有有效图片编号，"
+        "这类词条不会成为结论）",
+        "- 每条结论都附支撑它的图片编号，编号对应帖子 `image_list` 的顺序",
+        "",
+    ]
+
+    if analysis.posts_failed:
+        lines += [
+            f"**注意**：有 {_fmt_int(analysis.posts_failed)} 条帖子读取失败，"
+            "它们的风格**未被判定** —— 这不等于它们没有风格。",
+            "",
+        ]
+
+    if not analysis.findings:
+        lines += ["**本次没有产生任何风格结论。**", "", _empty_reason(analysis)]
+        return "\n".join(lines)
+
+    lines += [
+        "| 维度 | 词条 | 帖子数 | 总传播贡献 | 证据图 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for finding in analysis.findings:
+        lines.append(
+            "| {dimension} | {term} | {count} | {engagement} | {evidence} |".format(
+                dimension=_cell(finding.dimension, limit=20),
+                term=_cell(finding.term, limit=40),
+                count=_fmt_int(finding.post_count),
+                engagement=f"{finding.engagement_sum:.2f}",
+                evidence=_render_evidence(finding.evidence),
+            )
+        )
+    return "\n".join(lines)
+
+
+def _empty_reason(analysis: ReportStyleAnalysis) -> str:
+    """空结果也要给出原因，而不是留一个空区块。"""
+    if analysis.posts_read == 0 and analysis.posts_failed:
+        return "本次没有任何一条帖子被成功读取（原因见上方覆盖率）—— 这不是「没有风格」，是没读到。"
+    if analysis.posts_read == 0 and analysis.posts_no_image:
+        return "候选帖子都拿不到可用图片，无从判断。"
+    return (
+        "模型看过图，但没有在词表范围内发现可判定的风格信号。"
+        "这不等于「没有趋势」，只是这一批图里没有。"
+    )
+
+
+def _render_evidence(refs: tuple[ReportImageRef, ...], *, limit: int = 3) -> str:
+    """把证据渲染成可点的图号链接。非法协议（如 `javascript:`）退化成纯文本。"""
+    parts: list[str] = []
+    for ref in refs[:limit]:
+        label = _cell(f"{ref.note_id}#{ref.image_index}", limit=40)
+        url = _safe_url(ref.image_url)
+        parts.append(f"[{label}]({url})" if url else label)
+    if len(refs) > limit:
+        parts.append(f"…共 {_fmt_int(len(refs))} 张")
+    return "、".join(parts) or "—"
 
 
 def _render_text_clues(data: ReportData) -> str:

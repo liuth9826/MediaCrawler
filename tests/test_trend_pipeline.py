@@ -215,6 +215,62 @@ async def test_first_seen_run_id_survives_reruns(sqlite_env):
     assert {row.score_formula_version for row in rows} == {"v1"}
 
 
+def _score_row(platform: str, note_id: str, *, liked: int) -> store.PostScoreRow:
+    return store.PostScoreRow(
+        platform=platform,
+        note_id=note_id,
+        source_keyword="穿搭",
+        nickname="小*",
+        creator_hash="hash-a",
+        title="跨平台同 id",
+        desc_excerpt="x",
+        note_url=f"https://example.com/{note_id}",
+        publish_time=1750000000,
+        liked_count=liked,
+        collected_count=10,
+        comment_count=5,
+        share_count=1,
+        raw_score=float(liked),
+        composite_score=float(liked),
+        score_formula_version="v1",
+        tag_list=("通勤穿搭",),
+        image_count=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_is_scoped_to_platform(sqlite_env):
+    """回归：_update_row 的 UPDATE 过去只按 note_id 过滤，而 _load_existing 是按
+    (platform, note_id) 判定的 —— 于是「是否更新」是分平台的，更新动作却是全局的。
+    一旦两个平台撞上同一个 note_id，给一个平台重新打分会把另一个平台的行一起覆盖，
+    点赞、得分、最近运行 ID 全被带偏。唯一约束 (platform, note_id) 允许这种情况存在。"""
+    await store.init_trend_tables()
+
+    inserted, updated = await store.persist_scores(
+        [_score_row("xhs", "shared", liked=100), _score_row("dy", "shared", liked=777)],
+        run_id="run-a",
+    )
+    assert (inserted, updated) == (2, 0)
+
+    inserted, updated = await store.persist_scores(
+        [_score_row("xhs", "shared", liked=999)], run_id="run-b"
+    )
+    assert (inserted, updated) == (0, 1)
+
+    async with db_session.get_session() as session:
+        rows = (await session.execute(select(TrendPostScore))).scalars().all()
+    by_platform = {(row.platform, row.note_id): row for row in rows}
+    assert len(by_platform) == 2
+
+    assert by_platform[("xhs", "shared")].liked_count == 999
+    assert by_platform[("xhs", "shared")].last_scored_run_id == "run-b"
+
+    other = by_platform[("dy", "shared")]
+    assert other.liked_count == 777
+    assert other.composite_score == 777.0
+    assert other.last_scored_run_id == "run-a"
+
+
 # --------------------------------------------------------------------------- #
 # R6 + Q2：降级与可信度
 # --------------------------------------------------------------------------- #

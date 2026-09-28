@@ -354,7 +354,10 @@ async def _update_row(session: Any, row: PostScoreRow, run_id: str, now: int) ->
     # first_seen_run_id / created_ts 刻意不更新：首次出现时间必须稳定。
     statement = (
         update(TrendPostScore)
-        .where(TrendPostScore.note_id == row.note_id)
+        .where(
+            TrendPostScore.platform == row.platform,
+            TrendPostScore.note_id == row.note_id,
+        )
         .values(**values)
     )
     await session.execute(statement)

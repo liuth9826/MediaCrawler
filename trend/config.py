@@ -32,10 +32,14 @@ DEFAULT_SAVE_DATA_OPTION = "sqlite"
 # 正文摘要长度上限，避免报告被超长正文撑爆。
 DESC_EXCERPT_LEN = 280
 
-# 整批不完整的判定阈值：采集输出中的错误行数超过此**绝对值**即判 low（SDD 质量底线 Q2）。
-# 刻意不用比率：一个采集子进程的输出推不出本轮批次规模，若拿「错误行 / 库内条目数」折算，
-# 分母会随存档增长而稀释 —— 5000 条的归档里一次半失败批次只算出 2%，照样被判「完整」。
-LOW_CONFIDENCE_ERROR_LINES = int(os.getenv("TREND_LOW_CONFIDENCE_ERROR_LINES", "10"))
+# 整批不完整的判定：错误行数 / **本轮请求的目标量** 超过此比例即判 low。
+# 分母用「本轮目标」而不是「库内总条目」或「绝对条数」，是因为前者才是本轮批次规模。
+# 绝对条数不是尺度无关的 —— 实测同一失败率（7.5%）在 120 条批次被判 high、185 条批次
+# 被判 low，只因为绝对错误数一个在 10 以下一个在 10 以上。
+ERROR_RATE_THRESHOLD = float(os.getenv("TREND_ERROR_RATE_THRESHOLD", "0.25"))
+
+# 推不出本轮目标量（未指定 --max-notes 且读不到目标程序配置）时的兜底绝对阈值。
+ERROR_LINES_FALLBACK = int(os.getenv("TREND_ERROR_LINES_FALLBACK", "10"))
 
 # 采集子进程超时（秒）。0 表示不限时。
 CRAWL_TIMEOUT_SECONDS = float(os.getenv("TREND_CRAWL_TIMEOUT_SECONDS", "0")) or None

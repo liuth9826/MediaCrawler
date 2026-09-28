@@ -14,6 +14,8 @@ import threading
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
+import config as app_config
+
 from trend.config import (
     CRAWL_TIMEOUT_SECONDS,
     DEFAULT_SAVE_DATA_OPTION,
@@ -24,6 +26,15 @@ ERROR_MARKERS = ("error", "traceback", "exception", "失败", "错误", "超时"
 
 ERROR_SAMPLE_MAX_LINES = 20
 ERROR_SAMPLE_LEN = 2000
+
+# 爬虫在某个关键词的结果取尽时会打这一行（media_platform/xhs/core.py 的 search()）。
+# 连日志前缀一起匹配，避免误命中被爬内容里的同名文字。
+# 见到它意味着批次范围是**自然结束**的，而不是被失败截断 —— 这直接决定怎么解读错误行数：
+# 结果都取尽了，个别详情抓取失败就不可能让「整批」不完整。
+RESULTS_EXHAUSTED_MARKERS = ("[xiaohongshucrawler.search] no more content",)
+
+# 小红书搜索每页固定 20 条，且低于该值的上限会被抬到 20（media_platform/xhs/core.py）。
+XHS_PAGE_SIZE = 20
 
 # 采集超时的约定退出码，与 shell 的 124 保持一致。
 TIMEOUT_EXIT_CODE = 124
@@ -39,6 +50,7 @@ class CrawlOutcome:
     skipped: bool = False
     timed_out: bool = False
     spawn_failed: bool = False
+    results_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -161,6 +173,29 @@ def _streaming_executor(
     return process.returncode, "".join(collected), timed_out
 
 
+def requested_volume(
+    keywords: Sequence[str], options: CrawlOptions | None = None
+) -> int | None:
+    """本轮请求的目标条数；推不出时返回 None。
+
+    口径来自 media_platform/xhs/core.py 的 search()：``CRAWLER_MAX_NOTES_COUNT`` 是
+    **每关键词**上限（关键词在外层循环，页数上限按它逐词计算），低于每页 20 条时会被抬到 20。
+    未显式指定时读目标程序的配置默认值 —— 趋势层与爬虫读的是同一份 config。
+    """
+    active = options if options is not None else CrawlOptions()
+    per_keyword = active.max_notes
+    if per_keyword is None:
+        per_keyword = int(getattr(app_config, "CRAWLER_MAX_NOTES_COUNT", 0) or 0)
+    if per_keyword <= 0:
+        return None
+    return max(per_keyword, XHS_PAGE_SIZE) * max(len(keywords), 1)
+
+
+def _results_exhausted(output: str) -> bool:
+    lowered = output.lower()
+    return any(marker in lowered for marker in RESULTS_EXHAUSTED_MARKERS)
+
+
 def run_crawl(
     platform: str,
     keywords: Sequence[str],
@@ -204,4 +239,5 @@ def run_crawl(
         exit_code=exit_code,
         error_line_count=count,
         error_sample=sample,
+        results_exhausted=_results_exhausted(output),
     )

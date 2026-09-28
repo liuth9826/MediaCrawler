@@ -7,12 +7,15 @@
 
 import sys
 
+import config as app_config
+
 from trend.crawler import (
     SPAWN_FAILURE_EXIT_CODE,
     TIMEOUT_EXIT_CODE,
     CrawlOptions,
     build_command,
     count_error_lines,
+    requested_volume,
     run_crawl,
 )
 
@@ -134,6 +137,42 @@ def test_empty_login_type_and_cookies_are_not_forwarded():
     )
     assert "--lt" not in command
     assert "--cookies" not in command
+
+
+# --------------------------------------------------------------------------- #
+# 本轮请求目标量，以及「结果取尽」信号
+# --------------------------------------------------------------------------- #
+
+
+def test_requested_volume_is_per_keyword():
+    assert requested_volume(("穿搭",), CrawlOptions(max_notes=200)) == 200
+    assert requested_volume(("a", "b", "c"), CrawlOptions(max_notes=40)) == 120
+
+
+def test_requested_volume_floors_to_one_page():
+    """低于每页 20 条的上限会被爬虫抬到 20（小红书每页固定 20 条）。"""
+    assert requested_volume(("穿搭",), CrawlOptions(max_notes=5)) == 20
+
+
+def test_requested_volume_is_none_when_target_unreadable(monkeypatch):
+    monkeypatch.setattr(app_config, "CRAWLER_MAX_NOTES_COUNT", 0)
+    assert requested_volume(("穿搭",), CrawlOptions()) is None
+
+
+def test_run_crawl_detects_the_results_exhausted_sentinel():
+    def _executor(command, timeout=None):
+        return 0, "INFO - [XiaoHongShuCrawler.search] No more content!\n", False
+
+    assert run_crawl("xhs", ("穿搭",), executor=_executor).results_exhausted is True
+
+
+def test_results_exhausted_does_not_false_positive_on_crawled_content():
+    """连日志前缀一起匹配，避免被爬内容里的同名英文文字命中。"""
+
+    def _executor(command, timeout=None):
+        return 0, 'title: "no more content please, keep going"', False
+
+    assert run_crawl("xhs", ("穿搭",), executor=_executor).results_exhausted is False
 
 
 def test_run_crawl_reports_timeout_without_raising():

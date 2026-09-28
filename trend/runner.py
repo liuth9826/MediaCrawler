@@ -19,7 +19,8 @@ from trend.config import (
     DEFAULT_PLATFORM,
     DEFAULT_SAVE_DATA_OPTION,
     DEFAULT_TOP_N,
-    LOW_CONFIDENCE_ERROR_LINES,
+    ERROR_LINES_FALLBACK,
+    ERROR_RATE_THRESHOLD,
     REPORT_DIR,
     SCORE_FORMULA_VERSION,
 )
@@ -30,6 +31,7 @@ from trend.crawler import (
     CrawlOptions,
     CrawlOutcome,
     Executor,
+    requested_volume,
     run_crawl,
 )
 from trend.report import (
@@ -73,15 +75,22 @@ def assess_confidence(
     notes_total: int,
     notes_matched: int,
     notes_new: int,
-    error_line_threshold: int = LOW_CONFIDENCE_ERROR_LINES,
+    results_exhausted: bool = False,
+    requested: int | None = None,
+    error_rate_threshold: float = ERROR_RATE_THRESHOLD,
+    error_lines_fallback: int = ERROR_LINES_FALLBACK,
 ) -> tuple[str, str]:
     """判定「整批是否完整」。返回 (confidence, reason)。
 
-    要点（SDD 质量底线 Q2）：个别内容失败只体现为错误行数，只要未超阈值就不否定
-    整批；只有退出码非 0、库内全空、关键词零匹配、或错误行数超阈值才判 low。
+    要点（SDD 质量底线 Q2）：必须能区分「整批采集不完整」与「个别内容失败」。
 
-    阈值用绝对值而非比率：采集子进程的输出推不出本轮批次规模，拿「错误行 / 库内
-    条目数」折算会随存档增长而稀释，让大归档里的半失败批次蒙混过关。
+    两条判据都是被真机数据逼出来的，不是推出来的：
+
+    1. 爬虫报「结果取尽」时，批次范围由平台决定、而非被失败截断 —— 此时个别详情抓取
+       失败不可能让整批不完整，错误行数只作明细，不判 low。
+    2. 否则按「错误行 / **本轮请求目标量**」折算。分母必须是本轮目标：用库内总条目会随
+       存档增长而稀释；用绝对条数则不是尺度无关的 —— 实测同一失败率（7.5%）在 120 条
+       批次被判 high、在 185 条批次被判 low，只因为绝对错误数分别在 10 的两侧。
     """
     if crawl_skipped:
         return "unknown", "本次跳过采集，未评估本批次完整度；榜单基于既有存档。"
@@ -93,14 +102,45 @@ def assess_confidence(
         return "low", (
             f"关键词未匹配到任何已入库条目（库内共 {notes_total} 条），本次无法产出榜单。"
         )
-    if error_line_count > error_line_threshold:
+
+    exhausted_note = "爬虫报告搜索结果已取尽，批次范围完整"
+    if results_exhausted:
+        if notes_new <= 0:
+            return "high", (
+                f"{exhausted_note}，本次无新增；错误行 {error_line_count} 条属个别条目失败。"
+            )
+        return "high", (
+            f"{exhausted_note}；本次新增 {notes_new} 条，错误行 {error_line_count} 条"
+            "属个别条目失败，不否定整批。"
+        )
+
+    if requested and requested > 0:
+        rate = error_line_count / requested
+        if rate > error_rate_threshold:
+            return "low", (
+                f"采集输出错误行 {error_line_count} 条，占本轮请求目标 {requested} 条的 "
+                f"{rate:.0%}，超过阈值 {error_rate_threshold:.0%}，整批采集可能不完整。"
+            )
+        if notes_new <= 0:
+            return "high", (
+                f"本次无新增条目（既有存档已是最新）；错误行 {error_line_count} 条占目标 "
+                f"{requested} 条的 {rate:.0%}，未超阈值，批次完整。"
+            )
+        return "high", (
+            f"本次新增 {notes_new} 条，错误行 {error_line_count} 条占目标 {requested} 条的 "
+            f"{rate:.0%}，未超阈值，批次完整。"
+        )
+
+    if error_line_count > error_lines_fallback:
         return "low", (
-            f"采集输出错误行 {error_line_count} 条，超过阈值 {error_line_threshold} 条。"
-            "批次规模无法从采集子进程推知，故不按比率折算 —— 超过绝对阈值即视为整批可疑。"
+            f"推不出本轮目标量（未指定 --max-notes），错误行 {error_line_count} 条"
+            f"超过兜底阈值 {error_lines_fallback} 条，整批采集可能不完整。"
         )
     if notes_new <= 0:
-        return "high", "本次无新增条目（既有存档已是最新）；错误行未超阈值，批次视为完整。"
-    return "high", f"本次新增 {notes_new} 条，错误行 {error_line_count} 条，未超阈值，批次完整。"
+        return "high", "本次无新增条目（既有存档已是最新）；错误行未超兜底阈值，批次视为完整。"
+    return "high", (
+        f"本次新增 {notes_new} 条，错误行 {error_line_count} 条未超兜底阈值，批次完整。"
+    )
 
 
 def _crawl_or_record_failure(
@@ -314,16 +354,17 @@ async def run_pipeline(
         formula_version=SCORE_FORMULA_VERSION,
     )
 
+    # save_data_option 同时也决定本进程的存档后端，以它为准覆盖进采集参数 ——
+    # 否则会出现子进程写一个库、分析读另一个库的静默错位。
+    effective_options = replace(
+        crawl_options or CrawlOptions(), save_data_option=save_data_option
+    )
+
     if skip_crawl:
         outcome = CrawlOutcome(
             exit_code=0, error_line_count=0, error_sample="", skipped=True
         )
     else:
-        # save_data_option 同时也决定本进程的存档后端，以它为准覆盖进采集参数 ——
-        # 否则会出现子进程写一个库、分析读另一个库的静默错位。
-        effective_options = replace(
-            crawl_options or CrawlOptions(), save_data_option=save_data_option
-        )
         outcome = _crawl_or_record_failure(
             platform, active_keywords, effective_options, crawl_executor
         )
@@ -343,6 +384,10 @@ async def run_pipeline(
         notes_total=notes_total,
         notes_matched=len(notes),
         notes_new=notes_new,
+        results_exhausted=outcome.results_exhausted,
+        requested=None
+        if skip_crawl
+        else requested_volume(active_keywords, effective_options),
     )
     # 运行状态必须如实反映采集结果：否则失败的采集会以 succeeded 落库，
     # 与该字段自己的契约（running/succeeded/failed）矛盾，也会骗过按 status 过滤的消费者。

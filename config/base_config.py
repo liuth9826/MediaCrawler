@@ -80,7 +80,10 @@ BROWSER_LAUNCH_TIMEOUT = 60
 # 用户需要在 Chrome 中开启远程调试：chrome://inspect/#remote-debugging
 # 或者使用命令行参数启动 Chrome：--remote-debugging-port=9222
 # 这种方式反检测效果最好，因为直接使用用户真实浏览器的所有 Cookie、扩展和浏览历史
-CDP_CONNECT_EXISTING = True
+# 注意：设为 True 会接管本机开着远程调试端口的浏览器。若那是日常浏览器，
+# 抓取就会以该浏览器的登录账号身份进行 —— 影响的是账号身份，不只是 cookie。
+# 而且连接失败时不会回退到自起实例，只会等满超时后报错。
+CDP_CONNECT_EXISTING = False
 
 # 程序结束时是否自动关闭浏览器
 # 设置为 False 可以保持浏览器运行，方便调试

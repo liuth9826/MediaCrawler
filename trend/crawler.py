@@ -41,14 +41,51 @@ class CrawlOutcome:
     spawn_failed: bool = False
 
 
+@dataclass(frozen=True)
+class CrawlOptions:
+    """透传给采集子进程的可选项。
+
+    每一项为 None / 空 时**不追加**对应参数，让目标程序用它自己的配置默认值 ——
+    这样趋势层不会悄悄覆盖用户已有的设置，只在显式指定时才插手。
+
+    之所以收成一个对象：这些选项要穿过 cli → runner → crawler 三层，逐个当 kwarg 传
+    会把每层签名都撑开；收成对象后每层只需一个参数，且「哪些会透传」一目了然。
+    """
+
+    headless: bool = False
+    save_data_option: str = DEFAULT_SAVE_DATA_OPTION
+    start_page: int | None = None
+    max_notes: int | None = None
+    login_type: str | None = None
+    cookies: str | None = None
+
+    def to_argv(self) -> list[str]:
+        argv = [
+            "--save_data_option",
+            self.save_data_option,
+            # --headless 是取值选项（yes/no），不是裸开关。
+            "--headless",
+            "true" if self.headless else "false",
+        ]
+        if self.start_page is not None:
+            argv += ["--start", str(self.start_page)]
+        if self.max_notes is not None:
+            argv += ["--crawler_max_notes_count", str(self.max_notes)]
+        if self.login_type:
+            argv += ["--lt", self.login_type]
+        if self.cookies:
+            argv += ["--cookies", self.cookies]
+        return argv
+
+
 def build_command(
     platform: str,
     keywords: Sequence[str],
     *,
-    headless: bool = False,
-    save_data_option: str = DEFAULT_SAVE_DATA_OPTION,
+    options: CrawlOptions | None = None,
 ) -> list[str]:
     """拼出等价于手工执行的采集命令。"""
+    active = options if options is not None else CrawlOptions()
     return [
         sys.executable,
         str(PROJECT_ROOT / "main.py"),
@@ -58,11 +95,7 @@ def build_command(
         "search",
         "--keywords",
         ",".join(keywords),
-        "--save_data_option",
-        save_data_option,
-        # --headless 是取值选项（yes/no），不是裸开关。
-        "--headless",
-        "true" if headless else "false",
+        *active.to_argv(),
     ]
 
 
@@ -132,9 +165,8 @@ def run_crawl(
     platform: str,
     keywords: Sequence[str],
     *,
-    headless: bool = False,
+    options: CrawlOptions | None = None,
     timeout: float | None = CRAWL_TIMEOUT_SECONDS,
-    save_data_option: str = DEFAULT_SAVE_DATA_OPTION,
     executor: Executor | None = None,
 ) -> CrawlOutcome:
     """跑一次采集。
@@ -142,9 +174,7 @@ def run_crawl(
     `executor` 可注入以便测试 —— 默认实时转发输出地跑子进程，测试里换成桩即可在
     无浏览器、无登录态下回归整条链路。
     """
-    command = build_command(
-        platform, keywords, headless=headless, save_data_option=save_data_option
-    )
+    command = build_command(platform, keywords, options=options)
     run_command = _streaming_executor if executor is None else executor
     effective_timeout = timeout or None
 

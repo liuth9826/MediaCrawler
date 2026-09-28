@@ -10,6 +10,7 @@ import sys
 from trend.crawler import (
     SPAWN_FAILURE_EXIT_CODE,
     TIMEOUT_EXIT_CODE,
+    CrawlOptions,
     build_command,
     count_error_lines,
     run_crawl,
@@ -21,7 +22,9 @@ def _value_of(command: list[str], flag: str) -> str:
 
 
 def test_build_command_matches_documented_cli_surface():
-    command = build_command("xhs", ("穿搭", "通勤穿搭"), headless=True)
+    command = build_command(
+        "xhs", ("穿搭", "通勤穿搭"), options=CrawlOptions(headless=True)
+    )
     assert command[0] == sys.executable
     assert command[1].endswith("main.py")
     assert _value_of(command, "--platform") == "xhs"
@@ -31,7 +34,7 @@ def test_build_command_matches_documented_cli_surface():
 
 
 def test_headless_is_a_value_option_not_a_bare_flag():
-    on = build_command("xhs", ("穿搭",), headless=True)
+    on = build_command("xhs", ("穿搭",), options=CrawlOptions(headless=True))
     off = build_command("xhs", ("穿搭",))
     assert _value_of(on, "--headless") == "true"
     assert _value_of(off, "--headless") == "false"
@@ -80,8 +83,57 @@ def test_run_crawl_passes_save_data_option_through_to_the_subprocess():
         seen["command"] = command
         return 0, "", False
 
-    run_crawl("xhs", ("穿搭",), save_data_option="postgres", executor=_executor)
+    run_crawl(
+        "xhs",
+        ("穿搭",),
+        options=CrawlOptions(save_data_option="postgres"),
+        executor=_executor,
+    )
     assert _value_of(seen["command"], "--save_data_option") == "postgres"
+
+
+# --------------------------------------------------------------------------- #
+# 透传参数：只显式指定时才传，其余交给目标程序自己的默认值
+# --------------------------------------------------------------------------- #
+
+
+def test_optional_crawl_flags_are_omitted_by_default():
+    """不指定就不传 —— 否则会用趋势层的猜测覆盖用户已有的配置。"""
+    command = build_command("xhs", ("穿搭",))
+    for flag in ("--start", "--crawler_max_notes_count", "--lt", "--cookies"):
+        assert flag not in command
+
+
+def test_start_and_max_notes_are_passed_through():
+    command = build_command(
+        "xhs", ("穿搭",), options=CrawlOptions(start_page=3, max_notes=120)
+    )
+    assert _value_of(command, "--start") == "3"
+    assert _value_of(command, "--crawler_max_notes_count") == "120"
+
+
+def test_login_type_and_cookies_are_passed_through():
+    command = build_command(
+        "xhs",
+        ("穿搭",),
+        options=CrawlOptions(login_type="cookie", cookies="a1=xyz; web_session=abc"),
+    )
+    assert _value_of(command, "--lt") == "cookie"
+    assert _value_of(command, "--cookies") == "a1=xyz; web_session=abc"
+
+
+def test_start_page_zero_is_still_forwarded():
+    """0 是合法页码，不能被当成「未指定」而丢掉。"""
+    command = build_command("xhs", ("穿搭",), options=CrawlOptions(start_page=0))
+    assert _value_of(command, "--start") == "0"
+
+
+def test_empty_login_type_and_cookies_are_not_forwarded():
+    command = build_command(
+        "xhs", ("穿搭",), options=CrawlOptions(login_type="", cookies="")
+    )
+    assert "--lt" not in command
+    assert "--cookies" not in command
 
 
 def test_run_crawl_reports_timeout_without_raising():

@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Sequence
@@ -27,6 +27,7 @@ from trend.analysis import AnalysisPost, analyse
 from trend.crawler import (
     ERROR_SAMPLE_LEN,
     SPAWN_FAILURE_EXIT_CODE,
+    CrawlOptions,
     CrawlOutcome,
     Executor,
     run_crawl,
@@ -105,8 +106,7 @@ def assess_confidence(
 def _crawl_or_record_failure(
     platform: str,
     keywords: Sequence[str],
-    headless: bool,
-    save_data_option: str,
+    options: CrawlOptions,
     crawl_executor: Executor | None,
 ) -> CrawlOutcome:
     """采集，并把任何采集期异常转成结果对象。
@@ -120,8 +120,7 @@ def _crawl_or_record_failure(
         return run_crawl(
             platform,
             keywords,
-            headless=headless,
-            save_data_option=save_data_option,
+            options=options,
             executor=crawl_executor,
         )
     except Exception as exc:  # noqa: BLE001 —— 采集期任何异常都要转成可记录的结果
@@ -293,8 +292,8 @@ async def run_pipeline(
     keywords: Sequence[str] | None = None,
     top_n: int = DEFAULT_TOP_N,
     skip_crawl: bool = False,
-    headless: bool = False,
     save_data_option: str = DEFAULT_SAVE_DATA_OPTION,
+    crawl_options: CrawlOptions | None = None,
     output_dir: str | Path | None = None,
     crawl_executor: Executor | None = None,
     vocabulary: Vocabulary | None = None,
@@ -320,8 +319,13 @@ async def run_pipeline(
             exit_code=0, error_line_count=0, error_sample="", skipped=True
         )
     else:
+        # save_data_option 同时也决定本进程的存档后端，以它为准覆盖进采集参数 ——
+        # 否则会出现子进程写一个库、分析读另一个库的静默错位。
+        effective_options = replace(
+            crawl_options or CrawlOptions(), save_data_option=save_data_option
+        )
         outcome = _crawl_or_record_failure(
-            platform, active_keywords, headless, save_data_option, crawl_executor
+            platform, active_keywords, effective_options, crawl_executor
         )
 
     notes_total = await store.count_notes(platform)

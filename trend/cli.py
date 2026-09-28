@@ -6,6 +6,7 @@
 """
 
 import asyncio
+from typing import Optional
 
 import typer
 
@@ -15,6 +16,7 @@ from trend.config import (
     DEFAULT_SAVE_DATA_OPTION,
     DEFAULT_TOP_N,
 )
+from trend.crawler import CrawlOptions
 from trend.runner import RunResult, rebuild_report, run_pipeline
 
 app = typer.Typer(
@@ -50,6 +52,22 @@ def run(
         False, "--skip-crawl", help="跳过采集，仅对既有存档重新打分出报告"
     ),
     headless: bool = typer.Option(False, "--headless", help="采集时无头运行"),
+    start: Optional[int] = typer.Option(
+        None, "--start", help="起始页码，缺省用 main.py 的配置默认值"
+    ),
+    max_notes: Optional[int] = typer.Option(
+        None,
+        "--max-notes",
+        help="本次最多采集条数，缺省用 main.py 的配置默认值（当前配置为 15）",
+    ),
+    lt: Optional[str] = typer.Option(
+        None, "--lt", help="登录方式：qrcode | phone | cookie"
+    ),
+    cookies: Optional[str] = typer.Option(
+        None,
+        "--cookies",
+        help="cookie 登录的 cookie 串（注意：会出现在进程列表与 shell 历史里）",
+    ),
     save_data_option: str = typer.Option(
         DEFAULT_SAVE_DATA_OPTION,
         "--save-data-option",
@@ -65,8 +83,14 @@ def run(
             keywords=_split_keywords(keywords),
             top_n=top_n,
             skip_crawl=skip_crawl,
-            headless=headless,
             save_data_option=save_data_option,
+            crawl_options=CrawlOptions(
+                headless=headless,
+                start_page=start,
+                max_notes=max_notes,
+                login_type=lt,
+                cookies=cookies,
+            ),
             output_dir=out or None,
         )
     )

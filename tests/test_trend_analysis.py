@@ -170,3 +170,57 @@ def test_empty_input_is_handled(vocab):
     assert result.matched_posts == 0
     assert result.total_posts == 0
     assert result.by_dimension() == {}
+    assert result.tag_frequencies == ()
+
+
+# --------------------------------------------------------------------------- #
+# 原始标签词频：词表聚类的对照基准
+# --------------------------------------------------------------------------- #
+
+
+def test_raw_tag_frequencies_are_counted_verbatim_not_merged(vocab):
+    """必须逐字统计。若也做归并，就没有东西可以核对词表归得对不对了。"""
+    posts = [
+        _post("a", tags=("韩系穿搭", "外套")),
+        _post("b", tags=("韩系穿搭",)),
+        _post("c", tags=("松弛感穿搭",)),
+    ]
+    result = analyse(posts, vocab)
+    counted = {item.tag: item.post_count for item in result.tag_frequencies}
+
+    assert counted["韩系穿搭"] == 2
+    assert counted["外套"] == 1
+    assert counted["松弛感穿搭"] == 1  # 未被归并掉
+    assert result.distinct_tags == 3
+    assert result.singleton_tags == 2
+
+
+def test_raw_tags_include_ones_the_vocabulary_ignores(vocab):
+    """`fyp` 这类噪声标签词表不认，但原始词频必须照实列出。"""
+    result = analyse([_post("a", tags=("fyp",))], vocab)
+    assert [item.tag for item in result.tag_frequencies] == ["fyp"]
+    assert result.findings == ()
+
+
+def test_raw_tag_frequency_ignores_blanks_and_duplicates_within_a_post(vocab):
+    result = analyse([_post("a", tags=("外套", "外套", "", "   "))], vocab)
+    assert [(i.tag, i.post_count) for i in result.tag_frequencies] == [("外套", 1)]
+
+
+def test_raw_tags_sorted_by_frequency_first(vocab):
+    posts = [_post("a", tags=("少",)), _post("b", tags=("多",)), _post("c", tags=("多",))]
+    assert [i.tag for i in analyse(posts, vocab).tag_frequencies] == ["多", "少"]
+
+
+def test_posts_without_tags_contribute_no_raw_frequencies(vocab):
+    result = analyse([_post("a", title="无标签", tags=())], vocab)
+    assert result.tag_frequencies == ()
+    assert result.distinct_tags == 0
+    assert result.singleton_tags == 0
+
+
+def test_top_tags_caps_the_list_without_mutating_the_data(vocab):
+    posts = [_post(str(i), tags=(f"标签{i}",)) for i in range(5)]
+    result = analyse(posts, vocab)
+    assert len(result.top_tags(2)) == 2
+    assert len(result.tag_frequencies) == 5

@@ -49,17 +49,36 @@ class DimensionFinding:
 
 
 @dataclass(frozen=True)
+class TagFrequency:
+    """原始标签的频次，**未做任何归一化**。
+
+    存在的意义是让词表的聚合成可核对：没有这张表，读者只能看到「风格:韩系 4 条」，
+    看不到构成它的原始标签是 `韩系穿搭`×4，也就无法判断词表有没有把信号归歪。
+    """
+
+    tag: str
+    post_count: int
+    engagement_sum: float
+
+
+@dataclass(frozen=True)
 class TextAnalysis:
     version: str
     findings: tuple[DimensionFinding, ...]
     matched_posts: int
     total_posts: int
+    tag_frequencies: tuple[TagFrequency, ...] = ()
+    distinct_tags: int = 0
+    singleton_tags: int = 0
 
     def by_dimension(self) -> dict[str, tuple[DimensionFinding, ...]]:
         grouped: dict[str, list[DimensionFinding]] = {}
         for finding in self.findings:
             grouped.setdefault(finding.dimension, []).append(finding)
         return {name: tuple(items) for name, items in grouped.items()}
+
+    def top_tags(self, limit: int) -> tuple[TagFrequency, ...]:
+        return self.tag_frequencies[:limit]
 
 
 def _drop_subsumed(terms: list[str]) -> list[str]:
@@ -141,9 +160,37 @@ def analyse(posts: Sequence[AnalysisPost], vocabulary: Vocabulary) -> TextAnalys
     # 维度内按总传播贡献降序；条数、词条作为稳定的次级次序。
     findings.sort(key=lambda f: (f.dimension, -f.engagement_sum, -f.post_count, f.term))
 
+    tag_frequencies = _count_raw_tags(posts)
+
     return TextAnalysis(
         version=vocabulary.version,
         findings=tuple(findings),
         matched_posts=len(matched_note_ids),
         total_posts=len(posts),
+        tag_frequencies=tag_frequencies,
+        distinct_tags=len(tag_frequencies),
+        singleton_tags=sum(1 for item in tag_frequencies if item.post_count == 1),
     )
+
+
+def _count_raw_tags(posts: Sequence[AnalysisPost]) -> tuple[TagFrequency, ...]:
+    """逐字统计原始标签，不做归并 —— 这是词表输出的对照基准。
+
+    帖子内重复的同一标签只计一次（真机上标签里有重复项）。
+    """
+    buckets: dict[str, list[AnalysisPost]] = {}
+    for post in posts:
+        for tag in {t.strip() for t in post.tags if t and t.strip()}:
+            buckets.setdefault(tag, []).append(post)
+
+    counted = [
+        TagFrequency(
+            tag=tag,
+            post_count=len(group),
+            engagement_sum=sum(item.engagement for item in group),
+        )
+        for tag, group in buckets.items()
+    ]
+    # 频次优先 —— 这张表要回答的是「哪些标签反复出现」，不是「哪个标签传播最好」。
+    counted.sort(key=lambda f: (-f.post_count, -f.engagement_sum, f.tag))
+    return tuple(counted)

@@ -35,6 +35,7 @@ from trend.report import (
     ReportData,
     ReportPost,
     ReportRun,
+    ReportTagFrequency,
     ReportTextAnalysis,
     ReportTextFinding,
     render_report,
@@ -228,6 +229,16 @@ def _build_text_analysis(
         ),
         matched_posts=analysis.matched_posts,
         total_posts=analysis.total_posts,
+        raw_tags=tuple(
+            ReportTagFrequency(
+                tag=item.tag,
+                post_count=item.post_count,
+                engagement_sum=item.engagement_sum,
+            )
+            for item in analysis.tag_frequencies
+        ),
+        distinct_tags=analysis.distinct_tags,
+        singleton_tags=analysis.singleton_tags,
     )
 
 

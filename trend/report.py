@@ -14,6 +14,10 @@ from trend.config import ENGAGEMENT_WEIGHTS
 
 MAX_CELL_LEN = 60
 
+# 原始标签词频表列出多少行。长尾很长（真机上 92% 的标签只出现一次），
+# 全列出来只会淹没重点，剩下的用一行说明代替。
+RAW_TAG_ROWS = 15
+
 _CONFIDENCE_LABELS = {
     "high": "高（high）",
     "low": "低（low）",
@@ -50,6 +54,13 @@ class ReportTextFinding:
 
 
 @dataclass(frozen=True)
+class ReportTagFrequency:
+    tag: str
+    post_count: int
+    engagement_sum: float
+
+
+@dataclass(frozen=True)
 class ReportTextAnalysis:
     """报告侧看到的文本线索。刻意用 report.py 自己的类型，不 import 分析模块 ——
     这样「报告渲染不依赖分析器」是一条结构性约束，而不是约定。"""
@@ -58,6 +69,9 @@ class ReportTextAnalysis:
     findings: tuple[ReportTextFinding, ...]
     matched_posts: int
     total_posts: int
+    raw_tags: tuple[ReportTagFrequency, ...] = ()
+    distinct_tags: int = 0
+    singleton_tags: int = 0
 
     def by_dimension(self) -> dict[str, tuple[ReportTextFinding, ...]]:
         grouped: dict[str, list[ReportTextFinding]] = {}
@@ -237,7 +251,9 @@ def _render_style_claim_status() -> str:
 
 def _render_text_clues(data: ReportData) -> str:
     analysis = data.text_analysis
-    if analysis is None or not analysis.findings:
+    # 只要有原始标签就值得出这一节 —— 即使一条词表词条都没命中，
+    # 「133 个标签里 123 个只出现一次」本身就是对趋势的一个回答。
+    if analysis is None or (not analysis.findings and not analysis.raw_tags):
         return ""
 
     lines = [
@@ -258,6 +274,8 @@ def _render_text_clues(data: ReportData) -> str:
         "",
     ]
 
+    lines += _render_raw_tags(analysis)
+
     for dimension, findings in analysis.by_dimension().items():
         lines += [
             f"### {_cell(dimension, limit=20)}",
@@ -273,6 +291,41 @@ def _render_text_clues(data: ReportData) -> str:
         lines.append("")
 
     return "\n".join(lines).rstrip()
+
+
+def _render_raw_tags(analysis: ReportTextAnalysis) -> list[str]:
+    """原始标签词频 —— 词表聚类的对照基准。
+
+    放在维度表之前是有意的：先给证据，再给归一化结果，读者才能核对词表有没有把
+    信号归歪（真机上就靠这张表发现过「复古」被「美式复古」重复计入）。
+    """
+    if not analysis.raw_tags:
+        return []
+
+    shown = analysis.raw_tags[:RAW_TAG_ROWS]
+    hidden = analysis.distinct_tags - len(shown)
+    lines = [
+        "### 原始标签词频（未归一化，供核对）",
+        "",
+        f"共 {_fmt_int(analysis.distinct_tags)} 个不同标签，其中 "
+        f"**{_fmt_int(analysis.singleton_tags)} 个只出现 1 次**。",
+        "",
+        "这正是词表需要存在的原因：单个标签太碎，读不出趋势。"
+        "下表未经任何归并，可与下方的维度表逐条对照 —— "
+        "它能暴露词表可能归错的地方。",
+        "",
+        "| 标签 | 帖子数 | 总传播贡献 |",
+        "| --- | --- | --- |",
+    ]
+    lines += [
+        f"| {_cell(item.tag, limit=40)} | {_fmt_int(item.post_count)} "
+        f"| {item.engagement_sum:.2f} |"
+        for item in shown
+    ]
+    if hidden > 0:
+        lines += ["", f"（仅列前 {len(shown)} 个；其余 {_fmt_int(hidden)} 个频次更低）"]
+    lines.append("")
+    return lines
 
 
 def _render_posts(data: ReportData) -> str:

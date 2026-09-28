@@ -9,6 +9,7 @@ from trend.report import (
     ReportData,
     ReportPost,
     ReportRun,
+    ReportTagFrequency,
     ReportTextAnalysis,
     ReportTextFinding,
     render_report,
@@ -268,3 +269,72 @@ def test_no_text_clues_section_when_nothing_matched():
         _data(text_analysis=_text_analysis(findings=(), matched_posts=0))
     )
     assert "文本线索" not in text
+
+
+# --------------------------------------------------------------------------- #
+# 原始标签词频：词表聚类的对照基准
+# --------------------------------------------------------------------------- #
+
+
+def _with_raw_tags(**overrides) -> ReportTextAnalysis:
+    base = dict(
+        raw_tags=(
+            ReportTagFrequency(tag="韩系穿搭", post_count=4, engagement_sum=44.54),
+            ReportTagFrequency(tag="每日穿搭", post_count=3, engagement_sum=33.0),
+        ),
+        distinct_tags=133,
+        singleton_tags=123,
+    )
+    base.update(overrides)
+    return _text_analysis(**base)
+
+
+def test_raw_tag_table_precedes_the_dimension_tables():
+    """先给证据、再给归一化结果 —— 顺序反了就失去了可核对性。"""
+    text = render_report(_data(text_analysis=_with_raw_tags()))
+    assert "原始标签词频（未归一化，供核对）" in text
+    assert text.index("原始标签词频") < text.index("### 风格")
+
+
+def test_raw_tag_table_states_the_singleton_share():
+    """这一行是词表存在的理由，必须出现在报告里。"""
+    text = render_report(_data(text_analysis=_with_raw_tags()))
+    assert "共 133 个不同标签，其中" in text
+    assert "123 个只出现 1 次" in text
+
+
+def test_raw_tag_table_lists_tags_verbatim():
+    text = render_report(_data(text_analysis=_with_raw_tags()))
+    assert "| 韩系穿搭 | 4 | 44.54 |" in text
+
+
+def test_raw_tag_table_caps_rows_and_states_the_remainder():
+    many = tuple(
+        ReportTagFrequency(tag=f"标签{i}", post_count=1, engagement_sum=1.0)
+        for i in range(20)
+    )
+    text = render_report(
+        _data(
+            text_analysis=_with_raw_tags(
+                raw_tags=many, distinct_tags=20, singleton_tags=20
+            )
+        )
+    )
+    assert "（仅列前 15 个；其余 5 个频次更低）" in text
+
+
+def test_raw_tag_table_absent_when_there_are_no_tags():
+    text = render_report(
+        _data(text_analysis=_text_analysis(findings=(), matched_posts=0))
+    )
+    assert "原始标签词频" not in text
+
+
+def test_text_clues_section_appears_for_raw_tags_even_with_no_vocabulary_match():
+    """一条词表词条都没命中时，「133 个标签里 123 个只出现一次」本身仍是结论。"""
+    text = render_report(
+        _data(
+            text_analysis=_with_raw_tags(findings=(), matched_posts=0)
+        )
+    )
+    assert "原始标签词频" in text

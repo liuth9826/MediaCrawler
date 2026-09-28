@@ -5,7 +5,14 @@
 尤其是那三条质量底线必须在报告里看得见。
 """
 
-from trend.report import ReportData, ReportPost, ReportRun, render_report
+from trend.report import (
+    ReportData,
+    ReportPost,
+    ReportRun,
+    ReportTextAnalysis,
+    ReportTextFinding,
+    render_report,
+)
 
 
 def _run(**overrides) -> ReportRun:
@@ -69,7 +76,7 @@ def _data(posts=(_post(),), keyword_counts=None, **overrides) -> ReportData:
 
 def test_report_declares_no_style_conclusions_in_this_slice():
     text = render_report(_data())
-    assert "风格结论：本切片不产出" in text
+    assert "风格结论：仍然不产出" in text
     assert "无图片证据不下风格结论" in text
     # 两类证据等级必须被点名，后续切片才能分区展示
     assert "text_only" in text
@@ -193,3 +200,71 @@ def test_meta_table_keeps_intentional_code_spans():
     text = render_report(_data())
     assert "`v1`" in text
     assert "`20260928-101010-abcd1234`" in text
+
+
+# --------------------------------------------------------------------------- #
+# 文本线索（text_only）：Q1 要求它自证不是风格结论
+# --------------------------------------------------------------------------- #
+
+
+def _text_analysis(**overrides) -> ReportTextAnalysis:
+    base = dict(
+        version="vocab-abc123-m1",
+        findings=(
+            ReportTextFinding(
+                dimension="风格",
+                term="韩系",
+                post_count=5,
+                engagement_sum=55.3,
+                engagement_mean=11.06,
+            ),
+            ReportTextFinding(
+                dimension="单品",
+                term="外套",
+                post_count=10,
+                engagement_sum=108.0,
+                engagement_mean=10.8,
+            ),
+        ),
+        matched_posts=18,
+        total_posts=20,
+    )
+    base.update(overrides)
+    return ReportTextAnalysis(**base)
+
+
+def test_text_clues_state_they_are_not_style_conclusions():
+    text = render_report(_data(text_analysis=_text_analysis()))
+    assert "文本线索（证据等级：text_only）" in text
+    assert "不是风格结论" in text
+    assert "**不是**「韩系风格正在流行」" in text
+
+
+def test_text_clues_record_the_vocabulary_version():
+    """Q3：报告必须声明用的是哪一版词表。"""
+    text = render_report(_data(text_analysis=_text_analysis()))
+    assert "词表版本" in text
+    assert "vocab-abc123-m1" in text
+
+
+def test_text_clues_are_grouped_by_dimension_ranked_by_engagement():
+    text = render_report(_data(text_analysis=_text_analysis()))
+    assert "### 风格" in text
+    assert "### 单品" in text
+    assert "| 韩系 | 5 | 55.30 | 11.06 |" in text
+
+
+def test_text_clues_report_coverage_honestly():
+    text = render_report(_data(text_analysis=_text_analysis()))
+    assert "20 条帖子中 18 条命中词条" in text
+
+
+def test_no_text_clues_section_when_analysis_is_absent():
+    assert "文本线索" not in render_report(_data())
+
+
+def test_no_text_clues_section_when_nothing_matched():
+    text = render_report(
+        _data(text_analysis=_text_analysis(findings=(), matched_posts=0))
+    )
+    assert "文本线索" not in text

@@ -41,6 +41,32 @@ class ReportPost:
 
 
 @dataclass(frozen=True)
+class ReportTextFinding:
+    dimension: str
+    term: str
+    post_count: int
+    engagement_sum: float
+    engagement_mean: float
+
+
+@dataclass(frozen=True)
+class ReportTextAnalysis:
+    """报告侧看到的文本线索。刻意用 report.py 自己的类型，不 import 分析模块 ——
+    这样「报告渲染不依赖分析器」是一条结构性约束，而不是约定。"""
+
+    version: str
+    findings: tuple[ReportTextFinding, ...]
+    matched_posts: int
+    total_posts: int
+
+    def by_dimension(self) -> dict[str, tuple[ReportTextFinding, ...]]:
+        grouped: dict[str, list[ReportTextFinding]] = {}
+        for finding in self.findings:
+            grouped.setdefault(finding.dimension, []).append(finding)
+        return {name: tuple(items) for name, items in grouped.items()}
+
+
+@dataclass(frozen=True)
 class ReportRun:
     run_id: str
     platform: str
@@ -64,6 +90,7 @@ class ReportData:
     total_scored: int
     keyword_counts: tuple[tuple[str, int], ...]
     top_n: int
+    text_analysis: ReportTextAnalysis | None = None
 
 
 # 能改写 Markdown 结构或注入 HTML 的字符。标题/标签/昵称都来自被爬平台，属不可信文本。
@@ -122,11 +149,13 @@ def render_report(data: ReportData) -> str:
         _render_metrics(data),
         "",
         _render_style_claim_status(),
-        "",
-        _render_posts(data),
-        "",
-        _render_footer(),
     ]
+
+    text_clues = _render_text_clues(data)
+    if text_clues:
+        blocks += ["", text_clues]
+
+    blocks += ["", _render_posts(data), "", _render_footer()]
     return "\n".join(blocks).rstrip() + "\n"
 
 
@@ -195,17 +224,55 @@ def _render_metrics(data: ReportData) -> str:
 def _render_style_claim_status() -> str:
     return "\n".join(
         [
-            "## 风格结论：本切片不产出",
+            "## 风格结论：仍然不产出",
             "",
-            "本切片只产出基于互动数据的帖子榜，尚未接入分析层，因此**报告中没有任何风格结论**。",
+            "本报告**没有任何风格 / 元素结论** —— 图片证据链路尚未接入，系统一张图都没看过。",
             "",
-            "这是刻意的。按质量底线「无图片证据不下风格结论」，在图片证据链路打通之前，"
-            "系统不输出任何风格 / 元素判断。后续切片会在此分区展示两类结论，并明确区分：",
-            "",
-            "- `text_only` —— 仅由标签与正文推出，不作为风格结论",
-            "- `image_backed` —— 模型确实读取过图片",
+            "这是质量底线「无图片证据不下风格结论」的直接结果。本报告中的文本统计一律标为 "
+            "`text_only`，**不构成风格判断**；等图片证据打通（切片 5），`image_backed` 的"
+            "结论会单独成区表述。",
         ]
     )
+
+
+def _render_text_clues(data: ReportData) -> str:
+    analysis = data.text_analysis
+    if analysis is None or not analysis.findings:
+        return ""
+
+    lines = [
+        "## 文本线索（证据等级：text_only）",
+        "",
+        "这是**标签与文案的词频 × 互动加权**，不是风格结论。",
+        "",
+        "换个说法：下面「韩系」「通勤」这些词的意思是「有 N 条帖子在标签或文案里含该词，"
+        "它们合计贡献了多少传播分」，而**不是**「韩系风格正在流行」。后一个判断需要看图，"
+        "本切片没看。",
+        "",
+        f"- 词表版本：`{_cell(analysis.version, limit=48)}`",
+        f"- 覆盖度：{_fmt_int(analysis.total_posts)} 条帖子中 "
+        f"{_fmt_int(analysis.matched_posts)} 条命中词条"
+        "（未命中的帖子既无标签、文案里也没有词表词条）",
+        "- 维度内排序：按**总传播贡献**（命中帖子的综合分之和）降序；"
+        "均值用于区分「靠条数堆起来」与「靠单条高传播」",
+        "",
+    ]
+
+    for dimension, findings in analysis.by_dimension().items():
+        lines += [
+            f"### {_cell(dimension, limit=20)}",
+            "",
+            "| 词条 | 帖子数 | 总传播贡献 | 均值 |",
+            "| --- | --- | --- | --- |",
+        ]
+        lines += [
+            f"| {_cell(item.term, limit=30)} | {_fmt_int(item.post_count)} "
+            f"| {item.engagement_sum:.2f} | {item.engagement_mean:.2f} |"
+            for item in findings
+        ]
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
 
 
 def _render_posts(data: ReportData) -> str:

@@ -523,15 +523,22 @@ def _to_stored_post(record: Any) -> StoredPost:
     )
 
 
-async def fetch_scored_posts(platform: str, *, limit: int) -> list[StoredPost]:
-    """按综合传播分降序取前 N。note_id 升序作为稳定的并列次序。"""
+async def fetch_scored_posts(
+    platform: str, *, limit: int | None = None
+) -> list[StoredPost]:
+    """按综合传播分降序取帖子。``limit=None`` 表示取全部。
+
+    之所以允许不设上限：词频分析必须跑在**全量**帖子上，只看榜单前 N 条会把词频截断。
+    榜单本身仍只取前 N 条，那是渲染层的事。
+    """
     async with _session() as session:
         statement = (
             select(TrendPostScore)
             .where(TrendPostScore.platform == platform)
             .order_by(TrendPostScore.composite_score.desc(), TrendPostScore.note_id.asc())
-            .limit(int(limit))
         )
+        if limit is not None:
+            statement = statement.limit(int(limit))
         result = await session.execute(statement)
         records = result.scalars().all()
     return [_to_stored_post(record) for record in records]

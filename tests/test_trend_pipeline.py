@@ -134,7 +134,7 @@ async def test_pipeline_scores_archive_and_writes_report(sqlite_env):
     written = result.report_path.read_text(encoding="utf-8")
     assert "穿搭趋势报告" in written
     assert "春季通勤穿搭" in written
-    assert "风格结论：本切片不产出" in written
+    assert "风格结论：仍然不产出" in written
 
 
 @pytest.mark.asyncio
@@ -286,7 +286,7 @@ async def test_rebuild_report_needs_no_crawl_and_no_model(sqlite_env):
     assert rebuilt.run_id == first.run_id
     assert rebuilt.scored == 3
     assert "春季通勤穿搭" in rebuilt.report_markdown
-    assert "风格结论：本切片不产出" in rebuilt.report_markdown
+    assert "风格结论：仍然不产出" in rebuilt.report_markdown
 
 
 # --------------------------------------------------------------------------- #

@@ -23,6 +23,7 @@ from trend.config import (
     REPORT_DIR,
     SCORE_FORMULA_VERSION,
 )
+from trend.analysis import AnalysisPost, analyse
 from trend.crawler import (
     ERROR_SAMPLE_LEN,
     SPAWN_FAILURE_EXIT_CODE,
@@ -30,7 +31,15 @@ from trend.crawler import (
     Executor,
     run_crawl,
 )
-from trend.report import ReportData, ReportPost, ReportRun, render_report
+from trend.report import (
+    ReportData,
+    ReportPost,
+    ReportRun,
+    ReportTextAnalysis,
+    ReportTextFinding,
+    render_report,
+)
+from trend.vocab import Vocabulary, load_vocabulary
 
 
 @dataclass(frozen=True)
@@ -123,13 +132,22 @@ def _crawl_or_record_failure(
         )
 
 
-async def build_report_data(*, run_id: str, platform: str, top_n: int) -> ReportData:
+async def build_report_data(
+    *,
+    run_id: str,
+    platform: str,
+    top_n: int,
+    vocabulary: Vocabulary | None = None,
+) -> ReportData:
     """从存档装配报告数据。与重建共用同一条路径。"""
     run_record = await store.get_run(run_id)
     if run_record is None:
         raise KeyError(f"未找到运行记录 {run_id!r}")
 
-    stored = await store.fetch_scored_posts(platform, limit=top_n)
+    # 取全量：词频分析必须跑在所有帖子上，只看榜单前 N 条会截断词频。
+    all_posts = await store.fetch_scored_posts(platform)
+    board = all_posts[:top_n]
+
     report_run = ReportRun(
         run_id=run_record.run_id,
         platform=run_record.platform or platform,
@@ -163,7 +181,7 @@ async def build_report_data(*, run_id: str, platform: str, top_n: int) -> Report
             tag_list=item.tag_list,
             image_count=item.image_count,
         )
-        for index, item in enumerate(stored)
+        for index, item in enumerate(board)
     )
     return ReportData(
         run=report_run,
@@ -171,6 +189,45 @@ async def build_report_data(*, run_id: str, platform: str, top_n: int) -> Report
         total_scored=await store.count_scored(platform),
         keyword_counts=await store.count_by_keyword(platform),
         top_n=top_n,
+        text_analysis=_build_text_analysis(all_posts, vocabulary),
+    )
+
+
+def _build_text_analysis(
+    all_posts: Sequence[store.StoredPost], vocabulary: Vocabulary | None
+) -> ReportTextAnalysis:
+    """把规则分析结果映射成报告侧类型。
+
+    映射而非直接传分析模块的对象 —— 这样 report.py 不必 import 分析模块，
+    「报告渲染不依赖分析器」才是结构性保证而不是口头约定。
+    """
+    analysis = analyse(
+        [
+            AnalysisPost(
+                note_id=item.note_id,
+                title=item.title,
+                desc=item.desc_excerpt,
+                tags=item.tag_list,
+                engagement=item.composite_score,
+            )
+            for item in all_posts
+        ],
+        vocabulary if vocabulary is not None else load_vocabulary(),
+    )
+    return ReportTextAnalysis(
+        version=analysis.version,
+        findings=tuple(
+            ReportTextFinding(
+                dimension=finding.dimension,
+                term=finding.term,
+                post_count=finding.post_count,
+                engagement_sum=finding.engagement_sum,
+                engagement_mean=finding.engagement_mean,
+            )
+            for finding in analysis.findings
+        ),
+        matched_posts=analysis.matched_posts,
+        total_posts=analysis.total_posts,
     )
 
 
@@ -189,9 +246,16 @@ def write_report(
 
 
 async def _emit(
-    *, run_id: str, platform: str, top_n: int, output_dir: str | Path | None
+    *,
+    run_id: str,
+    platform: str,
+    top_n: int,
+    output_dir: str | Path | None,
+    vocabulary: Vocabulary | None = None,
 ) -> RunResult:
-    data = await build_report_data(run_id=run_id, platform=platform, top_n=top_n)
+    data = await build_report_data(
+        run_id=run_id, platform=platform, top_n=top_n, vocabulary=vocabulary
+    )
     markdown = render_report(data)
     path = write_report(
         markdown,
@@ -222,8 +286,9 @@ async def run_pipeline(
     save_data_option: str = DEFAULT_SAVE_DATA_OPTION,
     output_dir: str | Path | None = None,
     crawl_executor: Executor | None = None,
+    vocabulary: Vocabulary | None = None,
 ) -> RunResult:
-    """跑一次完整流水线。`crawl_executor` 可注入以便测试。"""
+    """跑一次完整流水线。`crawl_executor` / `vocabulary` 可注入以便测试。"""
     active_keywords = tuple(keywords or DEFAULT_KEYWORDS)
     store.use_backend(save_data_option)
     # 前置校验：platform 会先落库，之后还会成为报告文件名的一部分。
@@ -284,7 +349,11 @@ async def run_pipeline(
         error_sample=outcome.error_sample,
     )
     return await _emit(
-        run_id=run_id, platform=platform, top_n=top_n, output_dir=output_dir
+        run_id=run_id,
+        platform=platform,
+        top_n=top_n,
+        output_dir=output_dir,
+        vocabulary=vocabulary,
     )
 
 
@@ -295,6 +364,7 @@ async def rebuild_report(
     top_n: int = DEFAULT_TOP_N,
     save_data_option: str = DEFAULT_SAVE_DATA_OPTION,
     output_dir: str | Path | None = None,
+    vocabulary: Vocabulary | None = None,
 ) -> RunResult:
     """只读存档重建报告：不采集、不调用任何模型（SDD R6）。"""
     store.use_backend(save_data_option)
@@ -307,5 +377,9 @@ async def rebuild_report(
         run_id = latest.run_id
 
     return await _emit(
-        run_id=run_id, platform=platform, top_n=top_n, output_dir=output_dir
+        run_id=run_id,
+        platform=platform,
+        top_n=top_n,
+        output_dir=output_dir,
+        vocabulary=vocabulary,
     )

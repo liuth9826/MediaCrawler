@@ -338,3 +338,45 @@ def test_text_clues_section_appears_for_raw_tags_even_with_no_vocabulary_match()
         )
     )
     assert "原始标签词频" in text
+
+
+# --------------------------------------------------------------------------- #
+# 口径警示：关键词是查询的一部分，不是中立的抽样框
+# --------------------------------------------------------------------------- #
+
+
+def test_single_keyword_does_not_trigger_the_query_mix_warning():
+    text = render_report(_data(text_analysis=_text_analysis()))
+    assert "口径警示" not in text
+
+
+def test_multiple_keywords_warn_that_distributions_reflect_the_query_mix():
+    """真机上就是这里出过循环论证：搜了「韩系穿搭」，然后报告「韩系占 30%」。"""
+    text = render_report(
+        _data(
+            keyword_counts=(("穿搭", 60), ("韩系穿搭", 40), ("通勤穿搭", 20)),
+            text_analysis=_text_analysis(),
+        )
+    )
+    assert "口径警示" in text
+    assert "3 个关键词" in text
+    assert "不是发现" in text
+    assert "不要合并" in text
+    assert "同一个内容池" in text
+
+
+def test_query_mix_warning_precedes_the_distributions():
+    """警示必须在读者读到分布之前出现，否则等于没写。"""
+    text = render_report(
+        _data(
+            keyword_counts=(("穿搭", 60), ("韩系穿搭", 40)),
+            text_analysis=_text_analysis(),
+        )
+    )
+    assert text.index("口径警示") < text.index("文本线索")
+
+
+def test_text_clues_always_state_the_corpus_scope():
+    """即便只有一个关键词，那里也只是「搜索返回了什么」，不是平台整体分布。"""
+    text = render_report(_data(text_analysis=_text_analysis()))
+    assert "不等于平台整体分布" in text

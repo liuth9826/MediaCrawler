@@ -232,7 +232,33 @@ def _render_metrics(data: ReportData) -> str:
             f"- {_cell(keyword or '（空）', limit=40)}：{_fmt_int(count)}"
             for keyword, count in data.keyword_counts
         ]
+        lines += ["", *_render_query_mix_warning(data.keyword_counts)]
     return "\n".join(lines)
+
+
+def _render_query_mix_warning(
+    keyword_counts: tuple[tuple[str, int], ...],
+) -> list[str]:
+    """多关键词时的口径警示。
+
+    关键词是**查询**的一部分，不是中立的抽样框。把「穿搭 / 通勤穿搭 / 韩系穿搭」这类
+    异质（而且互相包含）的查询合并统计，得到的分布反映的是查询配比 —— 搜了韩系就会
+    得到更多韩系帖子，那是查询的结果，不是发现。真机上就靠这一点识破过一次循环论证。
+    """
+    keywords = "、".join(f"`{keyword or '（空）'}`" for keyword, _ in keyword_counts)
+    return [
+        f"> **口径警示：本次用了 {len(keyword_counts)} 个关键词（{keywords}），"
+        "而本报告的统计是对**整个存档聚合**的。**",
+        ">",
+        "> 因此下方各项分布反映的是**这些查询的配比**，而不是平台的整体分布。"
+        "搜了「韩系穿搭」自然就得到更多韩系帖子 —— 那是查询的结果，不是发现。",
+        ">",
+        "> 要读整体趋势，请用**单一宽泛关键词 + 深翻页**采集，让平台自身的排序决定构成。"
+        "窄关键词只适合回答它自己那个问题，且应单独看、**不要合并**。",
+        ">",
+        "> 另外避免使用互相包含的关键词（如 `穿搭` 与 `通勤穿搭`）—— "
+        "它们查回来的是同一个内容池。",
+    ]
 
 
 def _render_style_claim_status() -> str:
@@ -271,6 +297,8 @@ def _render_text_clues(data: ReportData) -> str:
         "（未命中的帖子既无标签、文案里也没有词表词条）",
         "- 维度内排序：按**总传播贡献**（命中帖子的综合分之和）降序；"
         "均值用于区分「靠条数堆起来」与「靠单条高传播」",
+        "- 范围：本节分布来自**本次搜索的返回结果**，回答的是「搜索返回了什么」，"
+        "不等于平台整体分布",
         "",
     ]
 

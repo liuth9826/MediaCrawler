@@ -11,7 +11,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-from trend.config import ENGAGEMENT_WEIGHTS, VISION_JUDGEMENT_DIMENSIONS
+from trend.config import (
+    ENGAGEMENT_WEIGHTS,
+    VISION_COMMON_TERM_RATE,
+    VISION_JUDGEMENT_DIMENSIONS,
+)
 
 MAX_CELL_LEN = 60
 
@@ -364,6 +368,8 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
         "「在流行」**。要判断「在涨」，需要两次相隔时间的运行做对比",
         "- 排序：按**总传播贡献**（命中帖子的综合分之和）降序；帖子数用于区分"
         "「靠条数堆起来」与「靠单条高传播」",
+        f"- 降级规则：命中率 ≥ {VISION_COMMON_TERM_RATE:.0%} 的词条不计入趋势判断 —— "
+        "出现在大多数帖子里说明它是内容池的底色而不是信号，已移到下方背景描述",
         "",
     ]
 
@@ -379,14 +385,10 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
         return "\n".join(lines)
 
     judgement = [
-        finding
-        for finding in analysis.findings
-        if finding.dimension in VISION_JUDGEMENT_DIMENSIONS
+        finding for finding in analysis.findings if _is_judgement(finding, analysis)
     ]
     background = [
-        finding
-        for finding in analysis.findings
-        if finding.dimension not in VISION_JUDGEMENT_DIMENSIONS
+        finding for finding in analysis.findings if not _is_judgement(finding, analysis)
     ]
 
     if not judgement and background:
@@ -408,12 +410,28 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
         lines += [
             f"### 背景描述（{'、'.join(_dimension_names(background))}）",
             "",
-            "这些是**画面里出现的元素**，不是趋势判断：它们在穿搭内容里普遍存在，"
+            "这里有两种东西，都不是趋势判断：**描述性维度**（画面里有什么），"
+            "以及**命中率过高的词条**（出现于大多数帖子，属于这个内容池的底色）。"
             "出现次数多不代表在流行。列在这里，是为了说明上面那些判断来自什么样的样本。",
             "",
             *_findings_table(background),
         ]
     return "\n".join(lines)
+
+
+def _is_judgement(finding: ReportStyleFinding, analysis: ReportStyleAnalysis) -> bool:
+    """该词条是否算「趋势判断」。两个条件都满足才算。
+
+    1. 维度是判断性的（风格 / 手法），不是描述性的（单品 / 场景 / …）；
+    2. 命中率够低 —— 出现在大多数帖子里说明它是这个内容池的底色，不是信号。
+    """
+    if finding.dimension not in VISION_JUDGEMENT_DIMENSIONS:
+        return False
+    if analysis.posts_read <= 0:
+        # 没有成功读数就算不出命中率。此时不降级，也不假装它是趋势 ——
+        # 覆盖率行与失败提示已经说明了这一轮的可信度。
+        return True
+    return finding.post_count / analysis.posts_read < VISION_COMMON_TERM_RATE
 
 
 def _dimension_names(findings: Sequence[ReportStyleFinding]) -> list[str]:

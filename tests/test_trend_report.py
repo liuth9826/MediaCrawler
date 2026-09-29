@@ -329,17 +329,137 @@ def test_background_only_run_states_that_no_judgement_was_made():
     assert "### 背景描述（单品）" in text
 
 
-def test_judgement_heading_is_derived_from_the_data_not_hardcoded():
-    """小标题跟着实际出现的维度走 —— 硬编码维度名会在词表改名后撒谎。"""
+def _ref(note_id="n1", index=1) -> ReportImageRef:
+    return ReportImageRef(
+        note_id=note_id,
+        image_index=index,
+        image_url=f"https://example.invalid/{index}.jpg",
+    )
+
+
+def test_a_judgement_term_appearing_in_most_posts_is_demoted_to_background():
+    """真机案例：「叠穿」20 条里命中 14 条（70%）—— 穿搭帖几乎必然叠穿。
+
+    把它排在趋势第一位等于没说，所以命中率过高的判断类词条也降到背景描述。
+    """
     text = render_report(
         _data(
             style_analysis=_style_analysis(
+                posts_read=20,
                 findings=(
                     ReportStyleFinding(
                         dimension="手法",
                         term="叠穿",
                         post_count=14,
-                        engagement_sum=147.35,
+                        engagement_sum=146.68,
+                        evidence=(_ref(),),
+                    ),
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="学院风",
+                        post_count=6,
+                        engagement_sum=61.51,
+                        evidence=(_ref(),),
+                    ),
+                ),
+            )
+        )
+    )
+
+    judgement_block, background_block = text.split("### 背景描述")
+
+    assert "学院风" in judgement_block
+    assert "叠穿" not in judgement_block
+    assert "叠穿" in background_block
+    assert "命中率过高" in background_block
+
+
+def test_a_term_exactly_at_the_threshold_is_demoted():
+    """恰好等于阈值也算过高 —— 边界要确定，不能靠浮点运气。"""
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                posts_read=10,
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="韩系",
+                        post_count=6,  # 6/10 = 60% = 阈值
+                        engagement_sum=60.0,
+                        evidence=(_ref(),),
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert "### 趋势判断" not in text
+    assert "没有得出任何风格 / 手法判断" in text
+
+
+def test_a_term_just_below_the_threshold_stays_a_judgement():
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                posts_read=10,
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="学院风",
+                        post_count=5,  # 5/10 = 50% < 60%
+                        engagement_sum=50.0,
+                        evidence=(_ref(),),
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert "### 趋势判断（风格）" in text
+    assert "### 背景描述" not in text
+
+
+def test_zero_reads_do_not_crash_or_silently_demote():
+    """读数为 0 时算不出命中率 —— 不能除零，也不能凭空降级。"""
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                posts_read=0,
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="韩系",
+                        post_count=0,
+                        engagement_sum=0.0,
+                        evidence=(_ref(),),
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert "### 趋势判断（风格）" in text
+
+
+def test_the_demotion_rule_is_stated_in_the_report():
+    text = render_report(_data(style_analysis=_style_analysis()))
+
+    assert "降级规则" in text
+    assert "60%" in text
+
+
+def test_judgement_heading_is_derived_from_the_data_not_hardcoded():
+    """小标题跟着实际出现的维度走 —— 硬编码维度名会在词表改名后撒谎。"""
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                posts_read=20,
+                findings=(
+                    ReportStyleFinding(
+                        dimension="手法",
+                        term="低饱和",
+                        post_count=3,
+                        engagement_sum=32.13,
                         evidence=(
                             ReportImageRef(
                                 note_id="n1",

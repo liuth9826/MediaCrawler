@@ -88,3 +88,11 @@ VISION_IMAGE_DIR = Path(
 # 放在 config 而不是词表里，是因为这是**呈现策略**，而 report.py 只 import config、
 # 不 import 词表（保持 R6 的纯度）。有测试钉死这里每个名字都存在于已发布词表中。
 VISION_JUDGEMENT_DIMENSIONS: tuple[str, ...] = ("风格", "手法")
+
+# 「判断」维度里命中率**过高**的词条同样降级为背景描述：出现在大多数帖子里的东西是
+# 这个内容池的底色，不是趋势。真机案例：「叠穿」在 20 条里命中 14 条（70%）—— 穿搭帖
+# 几乎必然叠穿，把它排在趋势第一位等于没说。
+#
+# 阈值放在报告侧判定，而不是写进聚合或落库：这是「够不够有区分度」的**解读**，不是
+# 「模型看到了什么」。这样调阈值不必重跑模型（R6），存的数据也不被改写。
+VISION_COMMON_TERM_RATE = float(os.getenv("TREND_VISION_COMMON_TERM_RATE", "0.6"))

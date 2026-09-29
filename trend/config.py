@@ -96,3 +96,13 @@ VISION_JUDGEMENT_DIMENSIONS: tuple[str, ...] = ("风格", "手法")
 # 阈值放在报告侧判定，而不是写进聚合或落库：这是「够不够有区分度」的**解读**，不是
 # 「模型看到了什么」。这样调阈值不必重跑模型（R6），存的数据也不被改写。
 VISION_COMMON_TERM_RATE = float(os.getenv("TREND_VISION_COMMON_TERM_RATE", "0.6"))
+
+# 一个词条要够格叫「趋势」，需要至少这么多帖子的支撑。
+#
+# 真机数据：50 帖里 12 条判断有 4 条只命中 1 帖，却和命中 13 帖的「低饱和」在报告里
+# 长得一模一样。单帖命中是轶事，不是趋势 —— 但也不该丢掉，所以单列一档「待观察」。
+VISION_MIN_POSTS_FOR_JUDGEMENT = int(os.getenv("TREND_VISION_MIN_POSTS", "3"))
+
+# 命中率规则需要足够大的分母才可信。50 帖里 1 帖 = 2%（安全），但 3 帖里 2 帖 = 67%
+# 会被误判成「太普遍」而降级。分母不足时**不套用比例规则**，只按最低帖数分档。
+VISION_MIN_READS_FOR_RATE_RULE = int(os.getenv("TREND_VISION_MIN_READS", "10"))

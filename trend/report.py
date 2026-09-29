@@ -15,6 +15,8 @@ from trend.config import (
     ENGAGEMENT_WEIGHTS,
     VISION_COMMON_TERM_RATE,
     VISION_JUDGEMENT_DIMENSIONS,
+    VISION_MIN_POSTS_FOR_JUDGEMENT,
+    VISION_MIN_READS_FOR_RATE_RULE,
 )
 
 MAX_CELL_LEN = 60
@@ -344,7 +346,12 @@ def _render_style_not_run(analysis: ReportStyleAnalysis | None) -> str:
     )
 
 
-def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
+def _render_style_meta(analysis: ReportStyleAnalysis) -> list[str]:
+    """区块头：版本、覆盖率、口径。
+
+    与下面的结论分档分开 —— 这一段回答「这次分析是怎么做的、可信度如何」，
+    那一段回答「得出了什么」，改动理由不同。
+    """
     lines = [
         "## 风格结论（证据等级：image_backed）",
         "",
@@ -370,6 +377,8 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
         "「靠条数堆起来」与「靠单条高传播」",
         f"- 降级规则：命中率 ≥ {VISION_COMMON_TERM_RATE:.0%} 的词条不计入趋势判断 —— "
         "出现在大多数帖子里说明它是内容池的底色而不是信号，已移到下方背景描述",
+        f"- 门槛：进入趋势判断需要至少 {VISION_MIN_POSTS_FOR_JUDGEMENT} 帖支撑；"
+        "不足的先列在「待观察」，**不算结论**",
         "",
     ]
 
@@ -379,59 +388,97 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
             "它们的风格**未被判定** —— 这不等于它们没有风格。",
             "",
         ]
+    return lines
+
+
+def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
+    lines = _render_style_meta(analysis)
 
     if not analysis.findings:
         lines += ["**本次没有产生任何风格结论。**", "", _empty_reason(analysis)]
         return "\n".join(lines)
 
-    judgement = [
-        finding for finding in analysis.findings if _is_judgement(finding, analysis)
-    ]
-    background = [
-        finding for finding in analysis.findings if not _is_judgement(finding, analysis)
-    ]
+    buckets: dict[str, list[ReportStyleFinding]] = {
+        _JUDGEMENT: [],
+        _TENTATIVE: [],
+        _BACKGROUND: [],
+    }
+    for finding in analysis.findings:
+        buckets[_classify(finding, analysis)].append(finding)
+    judgement = buckets[_JUDGEMENT]
+    tentative = buckets[_TENTATIVE]
+    background = buckets[_BACKGROUND]
 
-    if not judgement and background:
-        # 只有背景、没有判断时，必须说清楚 —— 否则读者会把「只有单品/场景」当成
-        # 「本次的趋势就是这些」。这与「把未运行说成没有」是同一类失真。
-        lines += [
-            "**本次没有得出任何风格 / 手法判断** —— 下面列出的都属于背景描述，"
-            "不构成趋势结论。",
-            "",
-        ]
+    if not judgement:
+        reasons: list[str] = []
+        if tentative:
+            reasons.append(f"「待观察」命中帖数不足 {VISION_MIN_POSTS_FOR_JUDGEMENT} 帖")
+        if background:
+            reasons.append("「背景描述」是画面里的常见元素、或命中率过高")
+        if reasons:
+            # 一条判断都没有时必须说清楚 —— 否则读者会把「待观察」或「背景描述」
+            # 当成本次的趋势。这与「把未运行说成没有」是同一类失真。
+            lines += [
+                f"**本次没有得出任何趋势判断** —— {'；'.join(reasons)}，都不构成趋势结论。",
+                "",
+            ]
     if judgement:
-        lines += [
-            f"### 趋势判断（{'、'.join(_dimension_names(judgement))}）",
-            "",
-            *_findings_table(judgement),
-            "",
-        ]
+        lines += _render_finding_section(
+            f"趋势判断（{'、'.join(_dimension_names(judgement))}）", judgement
+        )
+    if tentative:
+        lines += _render_finding_section(
+            f"待观察（{'、'.join(_dimension_names(tentative))}）",
+            tentative,
+            blurb=(
+                f"命中帖数少于 {VISION_MIN_POSTS_FOR_JUDGEMENT} 帖 —— "
+                "**单帖命中是轶事，不是趋势**。列在这里是为了不丢掉线索，"
+                "不是让你据此下判断；样本够了它们会自己升上来。"
+            ),
+        )
     if background:
-        lines += [
-            f"### 背景描述（{'、'.join(_dimension_names(background))}）",
-            "",
-            "这里有两种东西，都不是趋势判断：**描述性维度**（画面里有什么），"
-            "以及**命中率过高的词条**（出现于大多数帖子，属于这个内容池的底色）。"
-            "出现次数多不代表在流行。列在这里，是为了说明上面那些判断来自什么样的样本。",
-            "",
-            *_findings_table(background),
-        ]
+        lines += _render_finding_section(
+            f"背景描述（{'、'.join(_dimension_names(background))}）",
+            background,
+            blurb=(
+                "这里有两种东西，都不是趋势判断：**描述性维度**（画面里有什么），"
+                "以及**命中率过高的词条**（出现于大多数帖子，属于这个内容池的底色）。"
+                "出现次数多不代表在流行。列在这里，是为了说明上面那些判断来自什么样的样本。"
+            ),
+        )
     return "\n".join(lines)
 
 
-def _is_judgement(finding: ReportStyleFinding, analysis: ReportStyleAnalysis) -> bool:
-    """该词条是否算「趋势判断」。两个条件都满足才算。
+def _render_finding_section(
+    heading: str, findings: Sequence[ReportStyleFinding], *, blurb: str = ""
+) -> list[str]:
+    block = [f"### {heading}", ""]
+    if blurb:
+        block += [blurb, ""]
+    return [*block, *_findings_table(findings), ""]
 
-    1. 维度是判断性的（风格 / 手法），不是描述性的（单品 / 场景 / …）；
-    2. 命中率够低 —— 出现在大多数帖子里说明它是这个内容池的底色，不是信号。
+
+_JUDGEMENT = "judgement"
+_TENTATIVE = "tentative"
+_BACKGROUND = "background"
+
+
+def _classify(finding: ReportStyleFinding, analysis: ReportStyleAnalysis) -> str:
+    """把一条结论分档：趋势判断 / 待观察 / 背景描述。
+
+    两道关卡缺一不可：维度得是判断性的，支撑帖子数也得够。命中率规则**只在分母足够
+    大时才套用** —— 比例在小样本上会失真（3 帖里 2 帖 = 67%，会被误判成「太普遍」）。
     """
     if finding.dimension not in VISION_JUDGEMENT_DIMENSIONS:
-        return False
-    if analysis.posts_read <= 0:
-        # 没有成功读数就算不出命中率。此时不降级，也不假装它是趋势 ——
-        # 覆盖率行与失败提示已经说明了这一轮的可信度。
-        return True
-    return finding.post_count / analysis.posts_read < VISION_COMMON_TERM_RATE
+        return _BACKGROUND
+    if finding.post_count < VISION_MIN_POSTS_FOR_JUDGEMENT:
+        return _TENTATIVE
+    if (
+        analysis.posts_read >= VISION_MIN_READS_FOR_RATE_RULE
+        and finding.post_count / analysis.posts_read >= VISION_COMMON_TERM_RATE
+    ):
+        return _BACKGROUND
+    return _JUDGEMENT
 
 
 def _dimension_names(findings: Sequence[ReportStyleFinding]) -> list[str]:
@@ -508,6 +555,9 @@ def _render_text_clues(data: ReportData) -> str:
         "均值用于区分「靠条数堆起来」与「靠单条高传播」",
         "- 范围：本节分布来自**本次搜索的返回结果**，回答的是「搜索返回了什么」，"
         "不等于平台整体分布",
+        "- 本节刻意**不分区**：它的定位是原始对照表（词表把信号归得对不对，拿它核），"
+        "整节已声明不是风格结论，再拆成「趋势判断 / 待观察 / 背景描述」只是把一句"
+        "免责声明拆成三段",
         "",
     ]
 

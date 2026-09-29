@@ -324,7 +324,7 @@ def test_background_only_run_states_that_no_judgement_was_made():
         )
     )
 
-    assert "没有得出任何风格 / 手法判断" in text
+    assert "本次没有得出任何趋势判断" in text
     assert "### 趋势判断" not in text
     assert "### 背景描述（单品）" in text
 
@@ -394,7 +394,7 @@ def test_a_term_exactly_at_the_threshold_is_demoted():
     )
 
     assert "### 趋势判断" not in text
-    assert "没有得出任何风格 / 手法判断" in text
+    assert "本次没有得出任何趋势判断" in text
 
 
 def test_a_term_just_below_the_threshold_stays_a_judgement():
@@ -419,18 +419,22 @@ def test_a_term_just_below_the_threshold_stays_a_judgement():
     assert "### 背景描述" not in text
 
 
-def test_zero_reads_do_not_crash_or_silently_demote():
-    """读数为 0 时算不出命中率 —— 不能除零，也不能凭空降级。"""
+def test_small_samples_skip_the_rate_rule_instead_of_misjudging():
+    """命中率是比例，分母太小会失真：5 帖里 4 帖 = 80%，会被误判成「太普遍」。
+
+    分母不足时只按最低帖数分档，不套用比例规则。
+    """
     text = render_report(
         _data(
             style_analysis=_style_analysis(
-                posts_read=0,
+                posts_considered=5,
+                posts_read=5,
                 findings=(
                     ReportStyleFinding(
                         dimension="风格",
                         term="韩系",
-                        post_count=0,
-                        engagement_sum=0.0,
+                        post_count=4,  # 4/5 = 80%，比例很高，但样本只有 5 帖
+                        engagement_sum=40.0,
                         evidence=(_ref(),),
                     ),
                 ),
@@ -439,6 +443,82 @@ def test_zero_reads_do_not_crash_or_silently_demote():
     )
 
     assert "### 趋势判断（风格）" in text
+
+
+def test_a_term_with_too_few_posts_is_tentative_not_a_judgement():
+    """真机数据：50 帖里 12 条判断有 4 条只命中 1 帖。
+
+    它们在报告里和命中 13 帖的「低饱和」长得一模一样 —— 单帖命中是轶事，不是趋势。
+    """
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                posts_considered=50,
+                posts_read=50,
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="学院风",
+                        post_count=12,
+                        engagement_sum=61.0,
+                        evidence=(_ref(),),
+                    ),
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="三坑",
+                        post_count=1,
+                        engagement_sum=10.0,
+                        evidence=(_ref(),),
+                    ),
+                ),
+            )
+        )
+    )
+
+    judgement_block, tentative_block = text.split("### 待观察")
+
+    assert "学院风" in judgement_block
+    assert "三坑" not in judgement_block
+    assert "三坑" in tentative_block
+    assert "单帖命中是轶事" in tentative_block
+
+
+def test_a_tentative_only_run_says_there_is_no_trend_judgement():
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                posts_considered=50,
+                posts_read=50,
+                findings=(
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="三坑",
+                        post_count=1,
+                        engagement_sum=10.0,
+                        evidence=(_ref(),),
+                    ),
+                ),
+            )
+        )
+    )
+
+    assert "本次没有得出任何趋势判断" in text
+    assert "### 待观察（风格）" in text
+    assert "### 趋势判断" not in text
+
+
+def test_the_minimum_support_rule_is_stated_in_the_report():
+    text = render_report(_data(style_analysis=_style_analysis()))
+
+    assert "门槛" in text
+    assert "不算结论" in text
+
+
+def test_text_section_states_why_it_is_not_tiered_like_the_image_section():
+    """两个区标准不同是**有意的**，得写下来 —— 否则读者会以为是漏改。"""
+    text = render_report(_data(text_analysis=_text_analysis()))
+
+    assert "本节刻意**不分区**" in text
 
 
 def test_the_demotion_rule_is_stated_in_the_report():

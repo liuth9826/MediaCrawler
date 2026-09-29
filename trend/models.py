@@ -153,3 +153,39 @@ class TrendPostVision(Base):
     raw_excerpt = Column(Text, comment="模型原始回复(截断，仅供审计)")
     error = Column(Text, comment="错误信息")
     created_ts = Column(BigInteger, comment="创建时间戳")
+
+
+class TrendScoreSnapshot(Base):
+    """每次运行后的**帖子分数快照**。
+
+    存在的唯一理由：`trend_post_score` 每帖只有一行、每次采集原地覆盖互动数与综合分，
+    所以「上周这条帖多少赞」这类历史**不留痕**。没有快照，隔天再跑一次也攒不出时间
+    序列 —— 等再久都答不了「什么在涨」（SDD R4 的另一半）。
+
+    粒度是 (platform, note_id, run_id)：同一帖在不同运行里各留一行，差值就是变化量。
+    同一次运行重复写入会被唯一约束挡住（走「先查后写」跳过），所以重跑同一个 run_id
+    不会灌重复数据。
+    """
+
+    __tablename__ = "trend_score_snapshot"
+    __table_args__ = (
+        UniqueConstraint(
+            "platform",
+            "note_id",
+            "run_id",
+            name="uq_trend_score_snapshot_platform_note_run",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, comment="主键ID")
+    platform = Column(String(32), index=True, comment="平台")
+    note_id = Column(String(255), index=True, comment="帖子ID")
+    run_id = Column(String(64), index=True, comment="所属运行ID")
+    liked_count = Column(Integer, comment="点赞数(本次采集所见)")
+    collected_count = Column(Integer, comment="收藏数(本次采集所见)")
+    comment_count = Column(Integer, comment="评论数(本次采集所见)")
+    share_count = Column(Integer, comment="转发数(本次采集所见)")
+    raw_score = Column(Float, comment="加权原始分")
+    composite_score = Column(Float, comment="log1p 压制后的综合传播分")
+    score_formula_version = Column(String(32), comment="打分公式版本")
+    created_ts = Column(BigInteger, comment="快照时间戳")

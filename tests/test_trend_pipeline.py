@@ -9,7 +9,7 @@
 import json
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 import config as app_config
 from config import db_config
@@ -17,7 +17,7 @@ from database import db_session
 from database.models import XhsNote
 
 from trend import store
-from trend.models import TrendPostScore
+from trend.models import TrendPostScore, TrendScoreSnapshot
 from trend.runner import rebuild_report, run_pipeline
 
 
@@ -213,6 +213,105 @@ async def test_first_seen_run_id_survives_reruns(sqlite_env):
     assert {row.first_seen_run_id for row in rows} == {first.run_id}
     assert {row.last_scored_run_id for row in rows} == {second.run_id}
     assert {row.score_formula_version for row in rows} == {"v1"}
+
+
+# --------------------------------------------------------------------------- #
+# 分数快照：时间序列的唯一来源
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_pipeline_snapshots_every_post_for_the_run(sqlite_env):
+    await _seed_archive()
+
+    result = await run_pipeline(
+        keywords=("穿搭",),
+        top_n=10,
+        crawl_executor=_stub_runner(),
+        output_dir=sqlite_env / "reports",
+    )
+
+    async with db_session.get_session() as session:
+        rows = (
+            await session.execute(
+                select(TrendScoreSnapshot).where(
+                    TrendScoreSnapshot.run_id == result.run_id
+                )
+            )
+        ).scalars().all()
+
+    assert {row.note_id for row in rows} == {"n1", "n2", "n3"}
+    assert all(row.composite_score > 0 for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_snapshotting_the_same_run_twice_writes_nothing_new(sqlite_env):
+    """重跑同一个 run_id 不得灌重复快照 —— 否则差值会被重复计数。"""
+    await _seed_archive()
+    result = await run_pipeline(
+        keywords=("穿搭",),
+        top_n=10,
+        crawl_executor=_stub_runner(),
+        output_dir=sqlite_env / "reports",
+    )
+
+    again = await store.snapshot_scores("xhs", run_id=result.run_id)
+
+    assert again == 0
+    async with db_session.get_session() as session:
+        count = (
+            await session.execute(
+                select(func.count())
+                .select_from(TrendScoreSnapshot)
+                .where(TrendScoreSnapshot.run_id == result.run_id)
+            )
+        ).scalar()
+    assert count == 3
+
+
+@pytest.mark.asyncio
+async def test_snapshots_accumulate_a_time_series_across_runs(sqlite_env):
+    """快照表存在的唯一理由：同一帖在两个时点的分数都要留得住。
+
+    `trend_post_score` 会被下次采集原地覆盖，所以「上周这条帖多少赞」只能从快照读。
+    这条测试就是「什么在涨」的最小可行证明 —— 两个时点、两个值、可作差。
+    """
+    await _seed_archive()  # n1 的点赞是 "1.2万"
+    first = await run_pipeline(
+        keywords=("穿搭",),
+        top_n=10,
+        crawl_executor=_stub_runner(),
+        output_dir=sqlite_env / "reports",
+    )
+
+    # 模拟第二天的采集：同一条帖子的互动数涨了
+    async with db_session.get_session() as session:
+        await session.execute(
+            XhsNote.__table__.update()
+            .where(XhsNote.note_id == "n1")
+            .values(liked_count="2万")
+        )
+    second = await run_pipeline(
+        keywords=("穿搭",),
+        top_n=10,
+        crawl_executor=_stub_runner(),
+        output_dir=sqlite_env / "reports",
+    )
+
+    async with db_session.get_session() as session:
+        rows = (
+            await session.execute(
+                select(TrendScoreSnapshot)
+                .where(TrendScoreSnapshot.note_id == "n1")
+                .order_by(TrendScoreSnapshot.id)
+            )
+        ).scalars().all()
+
+    assert [row.run_id for row in rows] == [first.run_id, second.run_id]
+    assert rows[0].liked_count == 12000
+    assert rows[1].liked_count == 20000
+    # 差值即变化量 —— 「上升」就建立在这上面
+    assert rows[1].composite_score > rows[0].composite_score
 
 
 def _score_row(platform: str, note_id: str, *, liked: int) -> store.PostScoreRow:

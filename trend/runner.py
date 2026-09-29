@@ -486,6 +486,9 @@ async def run_pipeline(
         error_line_count=outcome.error_line_count,
         error_sample=outcome.error_sample,
     )
+    # 存一份本次运行的分数快照：`trend_post_score` 会被下次采集覆盖，不留快照就攒不出
+    # 时间序列，「什么在涨」也就无从谈起（SDD R4 的另一半）。
+    await store.snapshot_scores(platform, run_id=run_id)
     return await _emit(
         run_id=run_id,
         platform=platform,

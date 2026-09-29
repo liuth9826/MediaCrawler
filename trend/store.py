@@ -22,7 +22,13 @@ import config as app_config
 
 from trend import models  # noqa: F401 —— 导入即为注册 ORM 元数据，顺序不可省
 from trend.config import DESC_EXCERPT_LEN
-from trend.models import TrendCrawlRun, TrendPostScore, TrendPostVision, TrendStyleAnalysis
+from trend.models import (
+    TrendCrawlRun,
+    TrendPostScore,
+    TrendPostVision,
+    TrendScoreSnapshot,
+    TrendStyleAnalysis,
+)
 from trend.parsing import normalize_epoch_seconds, parse_engagement_count, parse_string_list
 from trend.scoring import composite_score
 from trend.vision import (
@@ -368,6 +374,64 @@ async def _update_row(session: Any, row: PostScoreRow, run_id: str, now: int) ->
         .values(**values)
     )
     await session.execute(statement)
+
+
+def _to_snapshot_orm(
+    row: Any, *, platform: str, run_id: str, now: int
+) -> TrendScoreSnapshot:
+    return TrendScoreSnapshot(
+        platform=platform,
+        note_id=str(row.note_id or ""),
+        run_id=run_id,
+        liked_count=row.liked_count or 0,
+        collected_count=row.collected_count or 0,
+        comment_count=row.comment_count or 0,
+        share_count=row.share_count or 0,
+        raw_score=row.raw_score or 0.0,
+        composite_score=row.composite_score or 0.0,
+        score_formula_version=row.score_formula_version or "",
+        created_ts=now,
+    )
+
+
+async def snapshot_scores(platform: str, *, run_id: str) -> int:
+    """把库内当前的分数存一份快照，归属到 `run_id`。返回写入行数。
+
+    为什么要这一步：`trend_post_score` 每帖一行、每次采集原地覆盖，历史不留痕。没有
+    快照，隔天再跑一次也攒不出时间序列 —— 「什么在涨」永远答不了（SDD R4 的另一半）。
+
+    **读库写库、而不是接收调用方传进来的行**：这样流水线与回填脚本共用一个入口，
+    快照内容也必然等于库里当时的分数，不会出现「传进来的行」与「落库的行」不一致。
+    """
+    async with _session() as session:
+        result = await session.execute(
+            select(TrendPostScore).where(TrendPostScore.platform == platform)
+        )
+        rows = result.scalars().all()
+        if not rows:
+            return 0
+
+        existing_result = await session.execute(
+            select(TrendScoreSnapshot.note_id).where(
+                TrendScoreSnapshot.platform == platform,
+                TrendScoreSnapshot.run_id == run_id,
+            )
+        )
+        existing = {str(row[0]) for row in existing_result.all()}
+
+        now = int(time.time())
+        written = 0
+        for row in rows:
+            note_id = str(row.note_id or "")
+            # 同一 run_id 重复调用时跳过已写过的帖子 —— 重跑不会灌重复快照。
+            if not note_id or note_id in existing:
+                continue
+            session.add(
+                _to_snapshot_orm(row, platform=platform, run_id=run_id, now=now)
+            )
+            written += 1
+        await session.flush()
+    return written
 
 
 # --------------------------------------------------------------------------- #

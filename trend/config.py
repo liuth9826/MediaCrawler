@@ -78,3 +78,13 @@ VISION_RETRY_AFTER_MAX = float(os.getenv("TREND_LLM_RETRY_AFTER_MAX", "30"))
 VISION_IMAGE_DIR = Path(
     os.getenv("TREND_IMAGE_DIR") or (PROJECT_ROOT / "data" / "trend_images")
 )
+
+# 报告分区的「判断」维度：这些维度回答「是什么风格 / 怎么搭的」，才是趋势判断。
+#
+# 其余维度（单品 / 场景 / 呈现 / 季节 / 品牌）是**背景描述** —— 它们在穿搭内容里普遍
+# 存在，真机上正是它们占满了榜首（内搭 10 帖、裙子 9 帖、开衫 9 帖…）。没有历史基线时
+# 「出现 9 次」说明不了「在流行」，所以必须在报告里与判断分开呈现，避免被读成趋势。
+#
+# 放在 config 而不是词表里，是因为这是**呈现策略**，而 report.py 只 import config、
+# 不 import 词表（保持 R6 的纯度）。有测试钉死这里每个名字都存在于已发布词表中。
+VISION_JUDGEMENT_DIMENSIONS: tuple[str, ...] = ("风格", "手法")

@@ -9,8 +9,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
-from trend.config import ENGAGEMENT_WEIGHTS
+from trend.config import ENGAGEMENT_WEIGHTS, VISION_JUDGEMENT_DIMENSIONS
 
 MAX_CELL_LEN = 60
 
@@ -358,6 +359,11 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
         f"{_fmt_int(analysis.rejected_terms)} 条（不在词表内、或没有有效图片编号，"
         "这类词条不会成为结论）",
         "- 每条结论都附支撑它的图片编号，编号对应帖子 `image_list` 的顺序",
+        "- 口径：表内「帖子数」是**本次候选集内**的命中次数（只分析了榜单前 N 条），"
+        "既不是平台整体分布、也不是时间趋势 —— **没有历史基线时，出现次数多不等于"
+        "「在流行」**。要判断「在涨」，需要两次相隔时间的运行做对比",
+        "- 排序：按**总传播贡献**（命中帖子的综合分之和）降序；帖子数用于区分"
+        "「靠条数堆起来」与「靠单条高传播」",
         "",
     ]
 
@@ -372,12 +378,59 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
         lines += ["**本次没有产生任何风格结论。**", "", _empty_reason(analysis)]
         return "\n".join(lines)
 
-    lines += [
+    judgement = [
+        finding
+        for finding in analysis.findings
+        if finding.dimension in VISION_JUDGEMENT_DIMENSIONS
+    ]
+    background = [
+        finding
+        for finding in analysis.findings
+        if finding.dimension not in VISION_JUDGEMENT_DIMENSIONS
+    ]
+
+    if not judgement and background:
+        # 只有背景、没有判断时，必须说清楚 —— 否则读者会把「只有单品/场景」当成
+        # 「本次的趋势就是这些」。这与「把未运行说成没有」是同一类失真。
+        lines += [
+            "**本次没有得出任何风格 / 手法判断** —— 下面列出的都属于背景描述，"
+            "不构成趋势结论。",
+            "",
+        ]
+    if judgement:
+        lines += [
+            f"### 趋势判断（{'、'.join(_dimension_names(judgement))}）",
+            "",
+            *_findings_table(judgement),
+            "",
+        ]
+    if background:
+        lines += [
+            f"### 背景描述（{'、'.join(_dimension_names(background))}）",
+            "",
+            "这些是**画面里出现的元素**，不是趋势判断：它们在穿搭内容里普遍存在，"
+            "出现次数多不代表在流行。列在这里，是为了说明上面那些判断来自什么样的样本。",
+            "",
+            *_findings_table(background),
+        ]
+    return "\n".join(lines)
+
+
+def _dimension_names(findings: Sequence[ReportStyleFinding]) -> list[str]:
+    """按出现顺序去重的维度名 —— 小标题跟着数据走，不硬编码维度列表。"""
+    names: dict[str, None] = {}
+    for finding in findings:
+        names.setdefault(finding.dimension, None)
+    return list(names)
+
+
+def _findings_table(findings: Sequence[ReportStyleFinding]) -> list[str]:
+    rows = [
         "| 维度 | 词条 | 帖子数 | 总传播贡献 | 证据图 |",
         "| --- | --- | --- | --- | --- |",
     ]
-    for finding in analysis.findings:
-        lines.append(
+    for finding in findings:
+        rows.append(
             "| {dimension} | {term} | {count} | {engagement} | {evidence} |".format(
                 dimension=_cell(finding.dimension, limit=20),
                 term=_cell(finding.term, limit=40),
@@ -386,7 +439,7 @@ def _render_style_conclusions(analysis: ReportStyleAnalysis) -> str:
                 evidence=_render_evidence(finding.evidence),
             )
         )
-    return "\n".join(lines)
+    return rows
 
 
 def _empty_reason(analysis: ReportStyleAnalysis) -> str:

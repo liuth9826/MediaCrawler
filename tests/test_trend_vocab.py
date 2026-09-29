@@ -34,6 +34,23 @@ def test_shipped_vocabulary_loads_and_is_grounded_in_real_tags():
     assert "优衣库" in vocab.dimensions["品牌"]
 
 
+def test_presentation_terms_are_not_filed_under_scene():
+    """「对镜拍 / 试衣间 / 原相机」是拍摄呈现方式，不是穿搭场景。
+
+    真机数据显示，混在「场景」里它们会跟着场景一起被读成穿搭趋势 —— 但它们描述的是
+    照片怎么拍的，不是穿了什么。
+    """
+    vocab = load_vocabulary()
+
+    assert "呈现" in vocab.dimensions
+    for term in ("试衣间", "对镜拍", "原相机", "素颜", "路人视角"):
+        assert term in vocab.dimensions["呈现"]
+        assert term not in vocab.dimensions["场景"]
+
+    # 真场景仍然留在场景里
+    assert "通勤" in vocab.dimensions["场景"]
+
+
 def test_version_is_derived_from_content_not_maintained_by_hand():
     """同样内容 → 同样版本；顺序无关；改一个词条 → 版本必变。"""
     base = vocabulary_version({"风格": ("韩系", "辣妹")})

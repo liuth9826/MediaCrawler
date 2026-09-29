@@ -5,6 +5,7 @@
 尤其是那三条质量底线必须在报告里看得见。
 """
 
+from trend.config import VISION_JUDGEMENT_DIMENSIONS
 from trend.report import (
     ReportData,
     ReportImageRef,
@@ -17,6 +18,7 @@ from trend.report import (
     ReportTextFinding,
     render_report,
 )
+from trend.vocab import load_vocabulary
 
 
 def _run(**overrides) -> ReportRun:
@@ -238,6 +240,142 @@ def test_hostile_finding_text_is_escaped_in_the_table():
     )
 
     assert "http://evil.invalid)" not in text
+
+
+def test_findings_are_split_into_judgement_and_background():
+    """真机教训：上榜的先是「内搭 10 帖 / 裙子 9 帖」这类背景词。
+
+    它们不是趋势判断 —— 穿搭内容里普遍存在。混在一张表里排前几名，读者会把
+    「出现次数多」读成「在流行」。
+    """
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                findings=(
+                    ReportStyleFinding(
+                        dimension="单品",
+                        term="内搭",
+                        post_count=10,
+                        engagement_sum=104.81,
+                        evidence=(
+                            ReportImageRef(
+                                note_id="n2",
+                                image_index=1,
+                                image_url="https://example.invalid/2.jpg",
+                            ),
+                        ),
+                    ),
+                    ReportStyleFinding(
+                        dimension="风格",
+                        term="学院风",
+                        post_count=4,
+                        engagement_sum=41.03,
+                        evidence=(
+                            ReportImageRef(
+                                note_id="n1",
+                                image_index=1,
+                                image_url="https://example.invalid/1.jpg",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+    )
+
+    assert "### 趋势判断（风格）" in text
+    assert "### 背景描述（单品）" in text
+    # 判断必须排在背景之前，否则读者先看到的是灌水那半张表
+    assert text.index("### 趋势判断") < text.index("### 背景描述")
+    assert "不是趋势判断" in text
+
+
+def test_background_section_is_omitted_when_there_are_only_judgements():
+    text = render_report(_data(style_analysis=_style_analysis()))
+
+    assert "### 趋势判断（风格）" in text
+    assert "### 背景描述" not in text
+
+
+def test_background_only_run_states_that_no_judgement_was_made():
+    """只有背景维度命中时必须说清楚 —— 否则读者会把它读成「本次的趋势就是这些」。
+
+    这与「把未运行说成没有」是同一类失真：没有判断，就要说没有判断。
+    """
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                findings=(
+                    ReportStyleFinding(
+                        dimension="单品",
+                        term="内搭",
+                        post_count=10,
+                        engagement_sum=104.81,
+                        evidence=(
+                            ReportImageRef(
+                                note_id="n1",
+                                image_index=1,
+                                image_url="https://example.invalid/1.jpg",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+    )
+
+    assert "没有得出任何风格 / 手法判断" in text
+    assert "### 趋势判断" not in text
+    assert "### 背景描述（单品）" in text
+
+
+def test_judgement_heading_is_derived_from_the_data_not_hardcoded():
+    """小标题跟着实际出现的维度走 —— 硬编码维度名会在词表改名后撒谎。"""
+    text = render_report(
+        _data(
+            style_analysis=_style_analysis(
+                findings=(
+                    ReportStyleFinding(
+                        dimension="手法",
+                        term="叠穿",
+                        post_count=14,
+                        engagement_sum=147.35,
+                        evidence=(
+                            ReportImageRef(
+                                note_id="n1",
+                                image_index=1,
+                                image_url="https://example.invalid/1.jpg",
+                            ),
+                        ),
+                    ),
+                )
+            )
+        )
+    )
+
+    heading = next(line for line in text.splitlines() if line.startswith("### 趋势判断"))
+    assert heading == "### 趋势判断（手法）"
+
+
+def test_evidence_scope_disclaimer_is_present():
+    """没有基线时，「出现次数多」说明不了「在流行」—— 这句话必须在场。"""
+    text = render_report(_data(style_analysis=_style_analysis()))
+
+    assert "没有历史基线时" in text
+    assert "出现次数多不等于「在流行」" in text
+
+
+def test_every_judgement_dimension_exists_in_the_shipped_vocabulary():
+    """分区策略写在 config、维度名却定义在词表 —— 用测试把两者绑住。
+
+    否则词表把「手法」改名后，config 里的旧名会静默失配：所有结论都被当成背景描述，
+    报告里再没有趋势判断，而且不会报错。
+    """
+    vocab = load_vocabulary()
+
+    missing = [d for d in VISION_JUDGEMENT_DIMENSIONS if d not in vocab.dimensions]
+
+    assert missing == []
 
 
 # --------------------------------------------------------------------------- #
